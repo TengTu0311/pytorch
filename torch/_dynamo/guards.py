@@ -5263,10 +5263,11 @@ class GuardsStatePickler(FunctionPicklerBase):
             pytype = maybe_get_fake_pytype_for_serialization(obj)
             if pytype is None:
                 pytype = type(obj)
-            # A fake answers empty_like with another fake through its own
-            # __torch_dispatch__, whether or not its FakeTensorMode is active,
-            # and that fake would drag the mode and its converters into the
-            # pickle; no_dispatch makes the template a plain meta tensor.
+            # A fake answers empty_like with another fake (a Python fake through
+            # its own __torch_dispatch__, whether or not its FakeTensorMode is
+            # active), and that fake would drag the mode and its converters into
+            # the pickle; no_dispatch, which also excludes the Fake dispatch key,
+            # makes the template a plain meta tensor.
             with no_dispatch() if is_fake else contextlib.nullcontext():
                 meta = torch.empty_like(
                     obj, device="meta", requires_grad=obj.requires_grad

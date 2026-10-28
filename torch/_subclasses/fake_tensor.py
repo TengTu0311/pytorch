@@ -482,6 +482,13 @@ def maybe_get_fake_pytype_for_serialization(x: object) -> type[Tensor] | None:
         if x.pytype is not None:
             return x.pytype
         return torch.nn.Parameter if isinstance(x, torch.nn.Parameter) else Tensor
+    if isinstance(x, Tensor) and torch._C._is_fake_tensor(x):
+        # A C++ fake's own type is the real type, but a C++ fake Parameter can
+        # be a plain Tensor carrying the marker.
+        t = type(x)
+        if t is Tensor and isinstance(x, torch.nn.Parameter):
+            return torch.nn.Parameter
+        return t
     return None
 
 
