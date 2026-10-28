@@ -7513,7 +7513,11 @@ def scaled_grouped_mm(
     group's flattened scale buffer in offset order. Each group starts at a 16-byte
     boundary, and per-group M/N need not be multiples of four. It requires
     cuBLASLt 13.8.1 or later (bundled with CUDA 13.4) on SM10.x/SM11.x and accepts
-    bfloat16, float16, and float32 outputs. Other recipes require bfloat16 output.
+    bfloat16, float16, and float32 outputs.
+
+    NVFP4 on the cuBLASLt backend requires CUDA 13.4 or later on SM10.x/SM11.x
+    and supports bfloat16, float16, and float32 outputs; the MSLK backend requires
+    bfloat16 output. Other recipes require bfloat16 output.
 
     Args:
         scale_a: Tensor containing decoding scaling factors for mat_a
