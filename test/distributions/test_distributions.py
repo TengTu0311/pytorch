@@ -161,6 +161,21 @@ def is_all_nan(tensor):
     return (tensor != tensor).all()
 
 
+def fork_default_device_rng():
+    """
+    Forks the RNG of the current default device, so that a reference draw and
+    the `rsample()` it is compared against consume the same random numbers.
+
+    `torch.get_rng_state()`/`torch.set_rng_state()` only cover the CPU
+    generator, which is not enough once the default device is an accelerator.
+    """
+    device = torch.get_default_device()
+    if device.type == "cpu":
+        # fork_rng always forks the CPU generator; torch.cpu has no get_rng_state.
+        return torch.random.fork_rng(devices=[])
+    return torch.random.fork_rng(devices=[device], device_type=device.type)
+
+
 Example = namedtuple("Example", ["Dist", "params"])
 
 
@@ -2325,8 +2340,6 @@ class TestDistributionsDevice(DistributionsTestCase):
             self.assertTrue((values < high).all().item())
 
     @expectedFailureMPS
-    @skipXPUIf(True, "https://github.com/intel/torch-xpu-ops/issues/4020")
-    @skipCUDAIf(True, "https://github.com/pytorch/pytorch/issues/200652")
     @set_default_dtype_if_supported(torch.double)
     def test_uniform(self):
         low = torch.zeros(5, 5, requires_grad=True)
@@ -2355,9 +2368,8 @@ class TestDistributionsDevice(DistributionsTestCase):
         self._gradcheck_log_prob(Uniform, (low, 1.0))
         self._gradcheck_log_prob(Uniform, (0.0, high))
 
-        state = torch.get_rng_state()
-        rand = low.new(low.size()).uniform_()
-        torch.set_rng_state(state)
+        with fork_default_device_rng():
+            rand = low.new(low.size()).uniform_()
         u = Uniform(low, high).rsample()
         u.backward(torch.ones_like(u))
         self.assertEqual(low.grad, 1 - rand)
@@ -2391,8 +2403,6 @@ class TestDistributionsDevice(DistributionsTestCase):
             self.assertLess(abs(norm - 1), 1e-3)
 
     @expectedFailureMPS
-    @skipXPUIf(True, "https://github.com/intel/torch-xpu-ops/issues/4020")
-    @skipCUDAIf(True, "https://github.com/pytorch/pytorch/issues/200652")
     @set_default_dtype_if_supported(torch.double)
     def test_cauchy(self):
         loc = torch.zeros(5, 5, requires_grad=True)
@@ -2412,9 +2422,8 @@ class TestDistributionsDevice(DistributionsTestCase):
         self._gradcheck_log_prob(Cauchy, (loc, 1.0))
         self._gradcheck_log_prob(Cauchy, (0.0, scale))
 
-        state = torch.get_rng_state()
-        eps = loc.new(loc.size()).cauchy_()
-        torch.set_rng_state(state)
+        with fork_default_device_rng():
+            eps = loc.new(loc.size()).cauchy_()
         c = Cauchy(loc, scale).rsample()
         c.backward(torch.ones_like(c))
         self.assertEqual(loc.grad, torch.ones_like(scale))
@@ -2425,8 +2434,6 @@ class TestDistributionsDevice(DistributionsTestCase):
         self._check_forward_ad(lambda x: x.cauchy_())
 
     @expectedFailureMPS
-    @skipXPUIf(True, "https://github.com/intel/torch-xpu-ops/issues/4020")
-    @skipCUDAIf(True, "https://github.com/pytorch/pytorch/issues/200652")
     @set_default_dtype_if_supported(torch.double)
     def test_halfcauchy(self):
         scale = torch.ones(5, 5, requires_grad=True)
@@ -2443,9 +2450,8 @@ class TestDistributionsDevice(DistributionsTestCase):
         self._gradcheck_log_prob(HalfCauchy, (scale,))
         self._gradcheck_log_prob(HalfCauchy, (1.0,))
 
-        state = torch.get_rng_state()
-        eps = scale.new(scale.size()).cauchy_().abs_()
-        torch.set_rng_state(state)
+        with fork_default_device_rng():
+            eps = scale.new(scale.size()).cauchy_().abs_()
         c = HalfCauchy(scale).rsample()
         c.backward(torch.ones_like(c))
         self.assertEqual(scale.grad, eps)
@@ -2803,8 +2809,6 @@ class TestDistributionsDevice(DistributionsTestCase):
         )
 
     @expectedFailureMPS
-    @skipXPUIf(True, "https://github.com/intel/torch-xpu-ops/issues/4020")
-    @skipCUDAIf(True, "https://github.com/pytorch/pytorch/issues/200652")
     @set_default_dtype_if_supported(torch.double)
     def test_normal(self):
         loc = torch.randn(5, 5, requires_grad=True)
@@ -2833,9 +2837,8 @@ class TestDistributionsDevice(DistributionsTestCase):
         self._gradcheck_log_prob(Normal, (loc, 1.0))
         self._gradcheck_log_prob(Normal, (0.0, scale))
 
-        state = torch.get_rng_state()
-        eps = torch.normal(torch.zeros_like(loc), torch.ones_like(scale))
-        torch.set_rng_state(state)
+        with fork_default_device_rng():
+            eps = torch.normal(torch.zeros_like(loc), torch.ones_like(scale))
         z = Normal(loc, scale).rsample()
         z.backward(torch.ones_like(z))
         self.assertEqual(loc.grad, torch.ones_like(loc))
@@ -3532,8 +3535,6 @@ class TestDistributionsDevice(DistributionsTestCase):
         self.assertEqual(d.variance, empirical_var, atol=0.5, rtol=0)
 
     @expectedFailureMPS
-    @skipXPUIf(True, "https://github.com/intel/torch-xpu-ops/issues/4020")
-    @skipCUDAIf(True, "https://github.com/pytorch/pytorch/issues/200652")
     @set_default_dtype_if_supported(torch.double)
     def test_exponential(self):
         rate = torch.randn(5, 5).abs().requires_grad_()
@@ -3546,9 +3547,8 @@ class TestDistributionsDevice(DistributionsTestCase):
         self.assertEqual(Exponential(50.0).sample((1,)).size(), (1,))
 
         self._gradcheck_log_prob(Exponential, (rate,))
-        state = torch.get_rng_state()
-        eps = rate.new(rate.size()).exponential_()
-        torch.set_rng_state(state)
+        with fork_default_device_rng():
+            eps = rate.new(rate.size()).exponential_()
         z = Exponential(rate).rsample()
         z.backward(torch.ones_like(z))
         self.assertEqual(rate.grad, -eps / rate**2)
@@ -3586,8 +3586,6 @@ class TestDistributionsDevice(DistributionsTestCase):
             )
 
     @expectedFailureMPS
-    @skipXPUIf(True, "https://github.com/intel/torch-xpu-ops/issues/4021")
-    @skipCUDAIf(True, "https://github.com/pytorch/pytorch/issues/200652")
     @set_default_dtype_if_supported(torch.double)
     def test_laplace(self):
         loc = torch.randn(5, 5, requires_grad=True)
@@ -3616,9 +3614,8 @@ class TestDistributionsDevice(DistributionsTestCase):
         self._gradcheck_log_prob(Laplace, (loc, 1.0))
         self._gradcheck_log_prob(Laplace, (0.0, scale))
 
-        state = torch.get_rng_state()
-        eps = torch.ones_like(loc).uniform_(-0.5, 0.5)
-        torch.set_rng_state(state)
+        with fork_default_device_rng():
+            eps = torch.ones_like(loc).uniform_(-0.5, 0.5)
         z = Laplace(loc, scale).rsample()
         z.backward(torch.ones_like(z))
         self.assertEqual(loc.grad, torch.ones_like(loc))
@@ -7205,7 +7202,7 @@ class TestJitDevice(DistributionsTestCase):
             if Dist in xfail:
                 continue
 
-            with torch.random.fork_rng():
+            with fork_default_device_rng():
                 sample = f(*values)
             traced_sample = traced_f(*values)
             self.assertEqual(sample, traced_sample)
@@ -7237,7 +7234,7 @@ class TestJitDevice(DistributionsTestCase):
             if Dist in xfail:
                 continue
 
-            with torch.random.fork_rng():
+            with fork_default_device_rng():
                 sample = f(*values)
             traced_sample = traced_f(*values)
             self.assertEqual(sample, traced_sample)
