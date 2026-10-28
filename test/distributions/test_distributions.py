@@ -112,6 +112,7 @@ from torch.testing._internal.common_device_type import (
     dtypesIfCUDA,
     dtypesIfXPU,
     expectedFailureMPS,
+    expectedFailureXPU,
     instantiate_device_type_tests,
     skipCUDAIf,
     skipMPS,
@@ -4844,7 +4845,7 @@ class TestRsampleDevice(DistributionsTestCase):
             )
 
     @unittest.skipIf(not TEST_NUMPY, "NumPy not found")
-    @skipXPUIf(True, "https://github.com/intel/torch-xpu-ops/issues/5212")
+    @expectedFailureXPU  # https://github.com/intel/torch-xpu-ops/issues/5212
     def test_dirichlet_on_diagonal(self):
         num_samples = 20
         grid = [1e-1, 1e0, 1e1]
@@ -4886,7 +4887,7 @@ class TestRsampleDevice(DistributionsTestCase):
             )
 
     @unittest.skipIf(not TEST_NUMPY, "NumPy not found")
-    @skipXPUIf(True, "https://github.com/intel/torch-xpu-ops/issues/5213")
+    @expectedFailureXPU  # https://github.com/intel/torch-xpu-ops/issues/5213
     def test_beta_wrt_alpha(self):
         num_samples = 20
         grid = [1e-2, 1e-1, 1e0, 1e1, 1e2]
