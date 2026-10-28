@@ -279,7 +279,11 @@ def set_proxy_slot(
 
 @overload
 def set_proxy_slot(
-    obj: PySymType, tracer: _ProxyTracer, proxy: _PySymProxyType
+    obj: PySymType,
+    tracer: _ProxyTracer,
+    proxy: _PySymProxyType,
+    *,
+    derived: bool = False,
 ) -> None: ...
 
 
@@ -287,6 +291,8 @@ def set_proxy_slot(
     obj: PySymType | _AnyScriptObjectType | Tensor | CustomClassBase,
     tracer: _ProxyTracer,
     proxy: object,
+    *,
+    derived: bool = False,
 ) -> None:
     log.debug("set_proxy_slot %s (%s) %s", obj, id(obj), proxy)
     if isinstance(obj, Tensor):
@@ -359,12 +365,18 @@ def set_proxy_slot(
             #
             # This is probably fixed in
             # https://github.com/pytorch/pytorch/pull/125941/
+            #
+            # A derived SymNode (the result of a traced sym op) must not replace
+            # an existing entry: its args may be untracked SymNodes that resolve
+            # through this very entry (e.g. sym_max(s0, 1) == s0 on DTensor's
+            # global sizes), and its lazy proxy would then depend on itself.
             import sympy
 
-            if isinstance(obj.node.expr, sympy.Symbol):
-                tracer.sympy_expr_tracker[obj.node.expr] = _SympyExprTrackerValue(
-                    proxy, obj
-                )
+            expr = obj.node.expr
+            if isinstance(expr, sympy.Symbol) and not (
+                derived and expr in tracer.sympy_expr_tracker
+            ):
+                tracer.sympy_expr_tracker[expr] = _SympyExprTrackerValue(proxy, obj)
 
 
 def has_proxy_slot(obj: Tensor, tracer: _ProxyTracer) -> bool:
@@ -539,19 +551,6 @@ def _get_proxies(t: torch.Tensor | TraceableWrapperSubclass) -> list[Proxy]:
     return proxies
 
 
-# sympy Max/Min are n-ary (they flatten, e.g. Max(a, Max(b, c)) -> Max(a, b, c)),
-# but torch.sym_max/sym_min are binary. Reduce so _build_proxy_for_sym_expr can
-# rebuild flattened expressions as nested binary ops. These are module-level
-# (not lambdas) so they have a qualified name and survive FX codegen/pickling
-# when used as a graph node target.
-def _nary_sym_max(*args: Any) -> Any:
-    return functools.reduce(torch.sym_max, args)
-
-
-def _nary_sym_min(*args: Any) -> Any:
-    return functools.reduce(torch.sym_min, args)
-
-
 @functools.cache
 def _sympy_handlers() -> dict[type[sympy.Expr], Callable[..., Any]]:
     """
@@ -567,15 +566,14 @@ def _sympy_handlers() -> dict[type[sympy.Expr], Callable[..., Any]]:
         op = getattr(operator, v, None)
         if op is not None:
             handlers[k] = op
-        # sympy Max/Min have no operator.* equivalent. Map them to n-ary-safe
-        # wrappers over torch.sym_max/sym_min. Without this,
+        # sympy Max/Min have no operator.* equivalent. Without these,
         # _build_proxy_for_sym_expr cannot rebuild expressions like Max(1, u2)
         # that escape a disable_proxy_modes_tracing region (e.g. DTensor shard
         # propagation size inference).
         elif v == "maximum":
-            handlers[k] = _nary_sym_max
+            handlers[k] = torch.sym_max
         elif v == "minimum":
-            handlers[k] = _nary_sym_min
+            handlers[k] = torch.sym_min
         # sympy.Pow / PowByNatural map to the interp name "pow_by_natural",
         # which has no operator.* equivalent. sympy canonicalizes x * x into
         # Pow(x, 2), so without this _build_proxy_for_sym_expr cannot rebuild
@@ -687,11 +685,12 @@ def _build_proxy_for_sym_expr(
     if not func:
         return None
 
-    # sympy Mul and Add are n-ary, but the handlers they map to (operator.mul,
-    # operator.add) take exactly two arguments, so an expression like s0*s1*s2
-    # has to be folded into a chain of binary ops. Fold rather than passing a
-    # variadic wrapper: the handler becomes the fx node's target, and that has
-    # to stay a real operator for downstream consumers.
+    # sympy Mul, Max and Min are n-ary, but the handlers they map to
+    # (operator.mul, torch.sym_max, torch.sym_min) take exactly two arguments,
+    # so an expression like s0*s1*s2 has to be folded into a chain of binary
+    # ops. Fold rather than passing a variadic wrapper: the handler becomes the
+    # fx node's target, and that has to stay a real operator for downstream
+    # consumers.
     if out is None:
         if len(args) > 2:
             return functools.reduce(func, args)
@@ -2329,7 +2328,7 @@ def _sym_register(
         p_out_thunk = thunkify(
             tracer, _compute_proxy, tracer, func=func, args=args, out=out
         )
-        set_proxy_slot(out, tracer, p_out_thunk)
+        set_proxy_slot(out, tracer, p_out_thunk, derived=True)
 
 
 def _compute_proxy(

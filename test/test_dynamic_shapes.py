@@ -1549,6 +1549,34 @@ Ne(Eq(u1, 1), Eq(u0, 1))""",
                 tracer.graph.output(out_proxy.node)
                 gm = fx.GraphModule(tracer.root, tracer.graph)
                 self.assertEqual(gm(2, 3, 4), expected)
+                # Every rebuilt node must target sym_op itself: Inductor only
+                # lowers the real sym operators, so a helper wrapper as a node
+                # target fails with "is not an OpOverload".
+                targets = {n.target for n in gm.graph.nodes if n.op == "call_function"}
+                self.assertEqual(targets, {sym_op})
+
+    def test_build_proxy_untracked_symint_no_cycle(self):
+        """
+        A SymInt computed with proxy tracing disabled (as DTensor sharding
+        propagation does) is untracked, so make_fx resolves it through its
+        sympy symbol. A traced sym_max(y, 1) simplifies to that same symbol;
+        it must not take over the symbol's entry, or forcing its lazy proxy
+        (thunkified, as under AOTAutograd) resolves y back to itself and
+        recurses forever.
+        """
+        from torch.fx.experimental.proxy_tensor import (
+            disable_proxy_modes_tracing,
+            maybe_enable_thunkify,
+        )
+
+        def f(x):
+            with maybe_enable_thunkify():
+                with disable_proxy_modes_tracing():
+                    y = x.shape[0] * 2 // 2
+                return x.new_zeros(torch.sym_max(y, 1))
+
+        gm = make_fx(f, tracing_mode="symbolic")(torch.randn(4))
+        self.assertEqual(gm(torch.randn(5)).shape, (5,))
 
     def test_build_proxy_for_pow(self):
         """
