@@ -1097,6 +1097,7 @@ class MetaConverter(Generic[_TensorT]):
             maybe_get_real_tensor,
             maybe_set_fake_device,
             maybe_set_real_tensor,
+            unset_fake_temporarily,
         )
 
         callback: _MetaTensorCallbackOptDevice[_TensorT] = functools.partial(
@@ -1866,7 +1867,11 @@ class MetaConverter(Generic[_TensorT]):
                                 # device="meta",
                             )
                             if self.copy_data:
-                                with torch.no_grad(), no_dispatch():
+                                with (
+                                    torch.no_grad(),
+                                    no_dispatch(),
+                                    unset_fake_temporarily(),
+                                ):
                                     real_tensor = torch.empty_strided(
                                         t.size,
                                         t.stride,
@@ -2078,7 +2083,11 @@ class MetaConverter(Generic[_TensorT]):
                             )
                         )
                         if self.copy_data:
-                            with torch.no_grad(), no_dispatch():
+                            with (
+                                torch.no_grad(),
+                                no_dispatch(),
+                                unset_fake_temporarily(),
+                            ):
                                 if t.size is None:
                                     raise AssertionError(
                                         "t.size must not be None when copy_data is True"
@@ -2193,7 +2202,11 @@ class MetaConverter(Generic[_TensorT]):
                                         raise AssertionError(
                                             "t.data must not be None when copy_data is True"
                                         )
-                                    with torch.no_grad(), no_dispatch():
+                                    with (
+                                        torch.no_grad(),
+                                        no_dispatch(),
+                                        unset_fake_temporarily(),
+                                    ):
                                         real_storage = _clone_real_storage_from_tensor(
                                             t.data
                                         )
@@ -2251,7 +2264,11 @@ class MetaConverter(Generic[_TensorT]):
                                 with maybe_fake_mgr:
                                     r.set_(r_s, storage_offset, sizes, strides)
                                 if self.copy_data:
-                                    with torch.no_grad(), no_dispatch():
+                                    with (
+                                        torch.no_grad(),
+                                        no_dispatch(),
+                                        unset_fake_temporarily(),
+                                    ):
                                         if not is_fake_tensor(r):
                                             raise AssertionError(
                                                 "Expected r to be a FakeTensor"
