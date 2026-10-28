@@ -3048,6 +3048,7 @@ class TestDistributionsDevice(DistributionsTestCase):
         self.assertEqual(m1.entropy(), m2.entropy())
 
     @expectedFailureMPS
+    @skipXPUIf(True, "https://github.com/intel/torch-xpu-ops/issues/5916")
     @skipCUDAIf(True, "https://github.com/pytorch/pytorch/issues/200652")
     def test_lowrank_multivariate_normal_moments(self):
         set_rng_seed(0)  # see Note [Randomized statistical tests]
