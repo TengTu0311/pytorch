@@ -21,59 +21,59 @@ GROUP_PREFIX = "# ["
 
 FAILURE_GUIDANCE = {
     "Uncovered paths": (
-        "Under the appropriate `# [surface]` in CODEOWNERS, add `# /path/` if "
-        "owners are unknown or `/path/ @owner` if ownership is known."
+        "In OWNERSHIP.yaml, add the path to an entry in the right section: a bare "
+        "path if owners are unknown, or `/path/: [handle]` to notify someone."
     ),
     "Duplicate patterns": (
-        "Search CODEOWNERS for the exact pattern and keep it under only one "
-        "`# [surface]` section."
+        "Search OWNERSHIP.yaml for the exact pattern and keep it in only one entry."
     ),
     "Stale patterns": (
-        "At the reported CODEOWNERS line, correct or remove the pattern; it matches "
-        "no committed path."
+        "In OWNERSHIP.yaml, correct or remove the reported pattern; it matches no "
+        "committed path."
     ),
     "Ineffective patterns": (
-        "At the reported CODEOWNERS line, move the commented pattern to the winning "
-        "surface, narrow it, or remove it."
+        "In OWNERSHIP.yaml, move the reported pattern to the entry that wins for its "
+        "paths, narrow it, or remove it."
     ),
     "Source-order mismatches": (
-        "In CODEOWNERS, place the broader pattern before the narrower override; "
-        "GitHub applies the last matching rule."
+        "In OWNERSHIP.yaml, put the broader pattern in an earlier section than the "
+        "narrower one; GitHub applies the last matching rule."
     ),
     "Missing effective surfaces": (
-        "Add a matching path under the named `# [surface]` in CODEOWNERS, or remove "
-        "that surface from the hierarchy."
+        "In OWNERSHIP.yaml, give the named section an entry with a path, or remove it "
+        "from `sections`."
     ),
     "Missing grouped sections": (
-        "Below `# Grouped review-surface definitions:`, add the missing "
-        "`# [surface]` section or remove its hierarchy declaration."
+        "In OWNERSHIP.yaml, add an entry for the missing section or remove it from "
+        "`sections`."
     ),
     "Undeclared grouped sections": (
-        "Add the section name to the review-surface hierarchy near the top of "
-        "CODEOWNERS, or rename or remove the section."
+        "In OWNERSHIP.yaml, add the section to `sections` or move its entries to "
+        "another section."
     ),
     "Label lines without an owner line": (
-        "Directly below the reported `# label:` line, add `# owner: @handle ...` "
-        "or `# owner: none`."
+        "Give the OWNERSHIP.yaml entry an `owners` list (`[]` for none), then "
+        "regenerate CODEOWNERS."
     ),
     "Misplaced owner lines": (
-        "Move the reported `# owner:` line directly below its `# label:` line."
+        "Regenerate CODEOWNERS from OWNERSHIP.yaml; owner lines are written directly "
+        "below label lines."
     ),
     "Invalid owner handles": (
-        "On the reported `# owner:` line, use GitHub users, teams, or emails, or "
-        "`none` on its own."
+        "In OWNERSHIP.yaml, list GitHub users, teams, or emails in the entry's "
+        "`owners`."
     ),
     "Label lists written more than once": (
-        "Give each reported `# label:` block a distinct label list, or merge the "
-        "blocks if they are one ownership area."
+        "In OWNERSHIP.yaml, give the entries distinct label lists, or merge them if "
+        "they are one ownership area."
     ),
     "Label lists with several owner lists": (
-        "Use the same `# owner:` list on every `# label:` line with these labels, "
-        "or give one of the blocks its own label list."
+        "In OWNERSHIP.yaml, give the entries distinct label lists, or merge them if "
+        "they are one ownership area."
     ),
     "Reviewers missing from owner lists": (
-        "Add the reported handles to the block's `# owner:` line, or move the "
-        "rule to a block whose owners include them."
+        "In OWNERSHIP.yaml, add the reported handles to the entry's `owners`, or "
+        "move the path to an entry whose owners include them."
     ),
     "Unneeded reviewer exceptions": (
         "Remove the reported entries from REVIEWERS_NOT_OWNERS in "
@@ -515,7 +515,10 @@ def print_report(report: Report) -> None:
     covered = report.tracked - len(report.uncovered)
     percentage = 100 * covered / report.tracked if report.tracked else 100.0
     print("CODEOWNERS taxonomy summary")
-    print("  Edit CODEOWNERS to fix failures reported below.")
+    print("  CODEOWNERS is generated: fix failures in OWNERSHIP.yaml, then run")
+    print(
+        "  scripts/codeowners/generate_codeowners.py. Line numbers refer to CODEOWNERS."
+    )
     print("  Use `/path/ @owner` for active ownership or `# /path/` when unresolved.")
     print(f"  Tracked paths: {report.tracked} (committed paths checked)")
     print(f"  Covered paths: {covered} (matched by at least one pattern)")
@@ -619,7 +622,7 @@ def main() -> int:
         if args.lintrunner:
             emit_lint_error(
                 f"CODEOWNERS taxonomy validation failed: {error}. "
-                "Fix the reported CODEOWNERS syntax or section error, then run "
+                "Fix it in OWNERSHIP.yaml and regenerate CODEOWNERS, then run "
                 "`python scripts/codeowners/check_taxonomy.py` locally."
             )
             return 0
