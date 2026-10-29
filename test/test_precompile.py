@@ -7493,7 +7493,7 @@ def fn(x, w):
 """
 
 
-_RUNTIME_CACHE_DRIVER = """
+_FRESH_REPLAY_PRELUDE = """
 import os
 import sys
 
@@ -7507,22 +7507,40 @@ if phase == "replay":
     os.environ["TORCH_PRECOMPILE_NO_COMPILATION"] = "1"
 
 import torch
+from triton.runtime.cache import FileCacheManager
 
 sys.path.insert(0, directory)
 fn = __import__(module).fn
 pc = torch.compiler.precompile
 artifact = os.path.join(directory, "artifact.py")
 cache = os.path.join(directory, "artifact.cache")
-expected_path = os.path.join(directory, "expected.pt")
 torch._inductor.config.use_static_cuda_launcher = True
 
 
-def inputs(seed):
+def inputs(seed, requires_grad=False):
     g = torch.Generator(device="cuda").manual_seed(seed)
-    x = torch.randn(64, 128, device="cuda", generator=g)
-    return x, torch.randn(128, 32, device="cuda", generator=g)
+    x = torch.randn(64, 128, device="cuda", generator=g, requires_grad=requires_grad)
+    w = torch.randn(128, 32, device="cuda", generator=g, requires_grad=requires_grad)
+    return x, w
 
 
+# A Triton JIT compile writes through the cache manager; replaying from the
+# imported runtime cache writes nothing. The runtime-cache transport refuses a
+# custom manager_class, so record in place.
+writes = []
+put = FileCacheManager.put
+
+
+def recording_put(self, data, filename, binary=True):
+    writes.append(filename)
+    return put(self, data, filename, binary=binary)
+"""
+
+
+_RUNTIME_CACHE_DRIVER = (
+    _FRESH_REPLAY_PRELUDE
+    + """
+expected_path = os.path.join(directory, "expected.pt")
 if phase == "capture":
     tracer = pc.DynamoTracer(require_no_risky_drops=False)
     # Tunes _scale_kernel before the capture: the capture tunes it again.
@@ -7531,18 +7549,6 @@ if phase == "capture":
         for seed in range(2):
             cap(*inputs(seed))
 else:
-    from triton.runtime.cache import FileCacheManager
-
-    # A Triton JIT compile or autotuning benchmark writes through the cache
-    # manager; replaying from the imported runtime cache writes nothing. The
-    # runtime-cache transport refuses a custom manager_class, so record in place.
-    writes = []
-    put = FileCacheManager.put
-
-    def recording_put(self, data, filename, binary=True):
-        writes.append(filename)
-        return put(self, data, filename, binary=binary)
-
     expected = torch.load(expected_path)
     FileCacheManager.put = recording_put
     with pc.no_compilation():
@@ -7552,6 +7558,117 @@ else:
     assert not writes, writes
 print("runtime cache phase ok:", phase)
 """
+)
+
+
+_NEVER_RUN_BACKWARD_MODULE = """
+def fn(x, w):
+    return (x @ w).softmax(-1)
+"""
+
+
+_NEVER_RUN_BACKWARD_DRIVER = (
+    _FRESH_REPLAY_PRELUDE
+    + """
+from torch._inductor.runtime.triton_heuristics import CachingAutotuner
+
+# The runtime-cache export refuses a kernel whose coordinate descent has not
+# run, so compile-time tuning must finish it for the never-run backward too.
+torch._inductor.config.coordinate_descent_tuning = True
+# Both config autotuning and coordinate descent benchmark through bench.
+benchmarked = []
+bench = CachingAutotuner.bench
+
+
+def recording_bench(self, *args, **kwargs):
+    benchmarked.append((self.is_backward, len(self.launchers)))
+    return bench(self, *args, **kwargs)
+
+
+CachingAutotuner.bench = recording_bench
+if phase == "capture":
+    tracer = pc.DynamoTracer(require_no_risky_drops=False)
+    with pc.capture(fn, artifact_path=artifact, cache_path=cache, tracer=tracer) as cap:
+        # Lowers the backward too, but no call runs it.
+        cap(*inputs(0, requires_grad=True))
+    # The backward was tuned across its configs while it lowered.
+    assert any(bw and n > 1 for bw, n in benchmarked), benchmarked
+else:
+    x, w = inputs(0, requires_grad=True)
+    expected = fn(x, w)
+    expected.sum().backward()
+    FileCacheManager.put = recording_put
+    x2, w2 = inputs(0, requires_grad=True)
+    with pc.no_compilation():
+        loaded = pc.load(artifact, cache)
+        out = loaded(x2, w2)
+        out.sum().backward()
+    torch.testing.assert_close(out, expected)
+    torch.testing.assert_close(x2.grad, x.grad)
+    torch.testing.assert_close(w2.grad, w.grad)
+    # Neither a Triton compile nor a tuning benchmark ran for the backward.
+    assert not writes, writes
+    assert not benchmarked, benchmarked
+print("never-run backward phase ok:", phase)
+"""
+)
+
+
+_MULTI_KERNEL_MODULE = """
+def fn(x, w):
+    return x.softmax(-1) + x.sum(-1, keepdim=True)
+"""
+
+
+_MULTI_KERNEL_DRIVER = (
+    _FRESH_REPLAY_PRELUDE
+    + """
+from torch._inductor.codegen.multi_kernel import MultiKernelCall
+from torch._inductor.runtime.triton_heuristics import CachingAutotuner
+
+torch._inductor.config.triton.multi_kernel = 1
+benchmarked = []
+bench = CachingAutotuner.bench
+benchmark_sub_kernels = MultiKernelCall.benchmark_sub_kernels
+
+
+def recording_bench(self, *args, **kwargs):
+    benchmarked.append("config")
+    return bench(self, *args, **kwargs)
+
+
+def recording_benchmark_sub_kernels(self, *args, **kwargs):
+    benchmarked.append("sub-kernel")
+    return benchmark_sub_kernels(self, *args, **kwargs)
+
+
+CachingAutotuner.bench = recording_bench
+MultiKernelCall.benchmark_sub_kernels = recording_benchmark_sub_kernels
+x, w = inputs(0)
+make_fx = sys.argv[4] == "make_fx"
+if phase == "capture":
+    if make_fx:
+        tracer = pc.MakeFxTracer()
+    else:
+        tracer = pc.DynamoTracer(require_no_risky_drops=False)
+    with pc.capture(fn, artifact_path=artifact, cache_path=cache, tracer=tracer) as cap:
+        cap(x, w)
+    assert "sub-kernel" not in benchmarked, benchmarked
+elif make_fx:
+    # A MakeFxTracer artifact freezes no runtime cache: its kernels compile on load.
+    os.environ.pop("TORCH_PRECOMPILE_NO_COMPILATION")
+    torch.testing.assert_close(pc.load(artifact, cache)(x, w), fn(x, w))
+    assert "sub-kernel" not in benchmarked, benchmarked
+else:
+    FileCacheManager.put = recording_put
+    with pc.no_compilation():
+        out = pc.load(artifact, cache)(x, w)
+    torch.testing.assert_close(out, fn(x, w))
+    assert not writes, writes
+    assert not benchmarked, benchmarked
+print("multi-kernel phase ok:", phase)
+"""
+)
 
 
 @skipIfTorchDynamo("precompile captures cannot run under dynamo wrapping")
@@ -9153,9 +9270,7 @@ class TestPrecompileRuntimeCache(TestCase):
             ):
                 TritonBundler.read_and_emit(bundle)
 
-    @skipIfCrossRef
-    @unittest.skipUnless(TEST_CUDA and HAS_TRITON, "requires Triton")
-    def test_strict_replay_in_fresh_process(self):
+    def _capture_and_replay(self, module_source, driver, marker, *extra_args):
         from torch.compiler._runtime_cache import _triton_runtime_cache
 
         if _triton_runtime_cache() is None:
@@ -9163,23 +9278,38 @@ class TestPrecompileRuntimeCache(TestCase):
         with tempfile.TemporaryDirectory() as directory:
             module = f"precompile_runtime_{uuid.uuid4().hex}"
             with open(os.path.join(directory, module + ".py"), "w") as f:
-                f.write(_RUNTIME_CACHE_MODULE)
+                f.write(module_source)
             for phase in ("capture", "replay"):
+                cmd = [sys.executable, "-c", driver, phase, directory, module]
                 out = subprocess.run(
-                    [
-                        sys.executable,
-                        "-c",
-                        _RUNTIME_CACHE_DRIVER,
-                        phase,
-                        directory,
-                        module,
-                    ],
-                    capture_output=True,
-                    text=True,
-                    timeout=900,
+                    [*cmd, *extra_args], capture_output=True, text=True, timeout=900
                 )
                 self.assertEqual(out.returncode, 0, out.stderr)
-                self.assertIn(f"runtime cache phase ok: {phase}", out.stdout)
+                self.assertIn(f"{marker}: {phase}", out.stdout)
+
+    @skipIfCrossRef
+    @unittest.skipUnless(TEST_CUDA and HAS_TRITON, "requires Triton")
+    def test_strict_replay_in_fresh_process(self):
+        self._capture_and_replay(
+            _RUNTIME_CACHE_MODULE, _RUNTIME_CACHE_DRIVER, "runtime cache phase ok"
+        )
+
+    @skipIfCrossRef
+    @unittest.skipUnless(TEST_CUDA and HAS_TRITON, "requires Triton")
+    def test_strict_replay_of_a_never_run_backward(self):
+        self._capture_and_replay(
+            _NEVER_RUN_BACKWARD_MODULE,
+            _NEVER_RUN_BACKWARD_DRIVER,
+            "never-run backward phase ok",
+        )
+
+    @skipIfCrossRef
+    @unittest.skipUnless(TEST_CUDA and HAS_TRITON, "requires Triton")
+    @parametrize("tracer", ["dynamo", "make_fx"])
+    def test_strict_replay_with_multi_kernel(self, tracer):
+        self._capture_and_replay(
+            _MULTI_KERNEL_MODULE, _MULTI_KERNEL_DRIVER, "multi-kernel phase ok", tracer
+        )
 
 
 _CUSTOM_OP_MODULE = """

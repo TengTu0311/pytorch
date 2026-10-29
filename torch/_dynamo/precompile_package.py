@@ -29,6 +29,7 @@ import dataclasses
 import functools
 import hashlib
 import importlib.machinery
+import logging
 import os
 import re
 import site
@@ -79,11 +80,42 @@ if TYPE_CHECKING:
     from .variables.builder import FrameStateSizeEntry
 
 
+log = logging.getLogger(__name__)
+
 # Built once: config.patch() allocates a class and a ContextVar each time it is
 # called, and this runs on every frame Dynamo compiles for a package.
 _ALLOW_EMPTY_GRAPHS = torch._dynamo.config._make_closure_patcher(
     allow_empty_graphs=True
 )
+
+
+def _frozen_kernel_config() -> dict[str, object]:
+    """The Triton config both precompile tracers lower under.
+
+    A frozen DynamoTracer artifact replays each kernel with one recorded
+    config, so every kernel is tuned before replay and no multi-kernel picks
+    its sub-kernel at first launch. Under autotune_at_compile_time the
+    Python wrapper emits multi-kernel defs only into the compile-time
+    autotune block (_write_multi_kernel_defs), so a MakeFxTracer module calls
+    an undefined multi_kernel_N (NameError on the first call). Warns once for
+    each user value overridden.
+    """
+    import torch._inductor.config as inductor_config
+
+    if inductor_config.triton.autotune_at_compile_time is False:
+        torch._logging.warning_once(
+            log,
+            "precompile capture overrides triton.autotune_at_compile_time=False: "
+            "a frozen artifact needs every kernel tuned before replay",
+        )
+    if inductor_config.triton.multi_kernel:
+        torch._logging.warning_once(
+            log,
+            "precompile capture overrides triton.multi_kernel=%s to 0: "
+            "the artifact does not record which sub-kernel a multi-kernel picks",
+            inductor_config.triton.multi_kernel,
+        )
+    return {"triton.autotune_at_compile_time": True, "triton.multi_kernel": 0}
 
 
 @contextlib.contextmanager
@@ -99,6 +131,21 @@ def _capture_config() -> Iterator[None]:
     inference call therefore compiles a backward too, and a backward the
     backend cannot compile fails the capture; capturing under
     ``torch.no_grad()`` avoids both.
+    Triton kernels autotune while their graph lowers, on generated example
+    inputs, as standalone_compile does: a backward no captured call runs would
+    otherwise keep every candidate config, and the artifact can only freeze a
+    kernel tuned down to one. This covers forward kernels too, which tune on
+    synthetic inputs at capture rather than on first launch: replay runs
+    frozen configs, so every kernel's config must be chosen before replay
+    anyway. Each kernel's synthetic arguments are allocated while the captured
+    forward's tensors are still live, so peak device memory during capture
+    grows by roughly the backward's working set.
+    ``triton.multi_kernel`` is off: a multi-kernel picks its sub-kernel by
+    benchmarking on first launch and the artifact does not record the choice.
+    Under ``cpp_wrapper`` the forced flag also turns off
+    ``triton.autotune_cublasLt`` (``get_cpp_wrapper_config``). Captured graphs
+    keep ``aten.repeat_interleave.Tensor`` as an aten fallback rather than
+    decomposing it, since its output depends on the data in ``repeat``.
     The bundled autotune remote cache stays off: AutotuneCacheBundler keeps one
     bundle per compile context, left open on a remote-cache miss until the
     first compiled call, but eager lowering compiles the forward and the
@@ -147,7 +194,12 @@ def _capture_config() -> Iterator[None]:
     # per CompileContext, which fixes every eager-backward caller.
     with (
         functorch_config.patch(functorch_patch),
-        inductor_config.patch(bundled_autotune_remote_cache=False),
+        inductor_config.patch(
+            {
+                "bundled_autotune_remote_cache": False,
+                **_frozen_kernel_config(),
+            }
+        ),
         torch._dynamo.config.patch(allow_empty_graphs=True),
     ):
         yield
