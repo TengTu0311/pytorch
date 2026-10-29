@@ -46,6 +46,7 @@ from torch.utils._config_module import ConfigModule
 from .aot_compile import _BUILTINS_DICT_PREFIX, _IMPORT_ALIAS_PREFIX
 from .convert_frame import ConvertFrame
 from .exc import PackageError
+from .graph_utils import _graph_device_types
 from .guards import (
     CheckFunctionManager,
     is_portable_function_guard,
@@ -1593,6 +1594,25 @@ class _CapturePackage(CompilePackage):
     def __init__(self, fn: Callable[..., Any]) -> None:
         super().__init__(fn)
         self.computing_frames: set[tuple[str, str, int]] = set()
+        # The operators each backend graph calls, by backend id, and those Dynamo
+        # graph-breaks on and runs eagerly because fake tensors failed to run them.
+        # Not recorded: the ops of a torch._dynamo.disable'd function; in a frame
+        # Dynamo falls back on, every op but the one it graph-broke on; under the
+        # eager backend the ops of a custom op's backward formula, which no graph
+        # holds; under cpp_wrapper the ops only Inductor's code calls (inserted by
+        # a post-grad pass, or in the backward), which it names in C++ strings;
+        # and those of a bypassed compile, whose frame serving re-traces under
+        # allow_serve_time_compiles=True. The artifact adds the ops Inductor's
+        # Python code calls.
+        self.op_names: dict[str, set[tuple[str, str]]] = {}
+        # The device types each backend graph runs on, by backend id.
+        self.device_types: dict[str, frozenset[str]] = {}
+        self.graph_break_op_names: set[tuple[str, str]] = set()
+        # The current compile's graph-break ops, kept only if it records a guarded
+        # code or falls back to eager, so a bypassed compile's ops are dropped like
+        # its backend graphs.
+        self._compile_graph_break_op_names: set[tuple[str, str]] = set()
+        self._compile_graph_break_code: types.CodeType | None = None
 
     def note_compute(self) -> None:
         if self._current_entry is not None:
@@ -1603,6 +1623,41 @@ class _CapturePackage(CompilePackage):
     ) -> None:
         self.note_compute()
         super()._add_backend_id(backend_id, backend)
+
+    def add_backend_graph(self, backend_id: str, gm: torch.fx.GraphModule) -> None:
+        from torch._precompile import _op_names
+
+        self.op_names[backend_id] = _op_names(gm)
+        self.device_types[backend_id] = _graph_device_types(gm.graph)
+
+    def add_graph_break_op(self, op: object) -> None:
+        from torch._precompile import _overload_names
+
+        self._compile_graph_break_op_names |= _overload_names(op)
+
+    @contextlib.contextmanager
+    def code_context(
+        self, code: types.CodeType, global_scope: dict[str, object] | None = None
+    ) -> Iterator[None]:
+        self._compile_graph_break_op_names = set()
+        self._compile_graph_break_code = code
+        with super().code_context(code, global_scope):
+            yield
+
+    def add_guarded_code(
+        self, guards_state: bytes, dynamo_code: types.CodeType
+    ) -> None:
+        super().add_guarded_code(guards_state, dynamo_code)
+        self.graph_break_op_names |= self._compile_graph_break_op_names
+
+    def record_eager_fallback(self, code: types.CodeType) -> None:
+        super().record_eager_fallback(code)
+        # Only the ops of the compile that gave up on this frame, not those a
+        # bypassed compile of another frame left behind.
+        if code is self._compile_graph_break_code:
+            self.graph_break_op_names |= self._compile_graph_break_op_names
+        self._compile_graph_break_op_names = set()
+        self._compile_graph_break_code = None
 
     def add_resume_function(
         self,
@@ -2111,15 +2166,54 @@ class PrecompileSession(Generic[_P, _R]):
         recorded, so run the session under ``with_fresh_cache()`` (``capture()``
         does) to keep it to this session's compiles.
         """
-        from torch._precompile import _build_multigraph_artifact
+        from torch._functorch._aot_autograd.aot_autograd_result import (
+            BundledAOTAutogradCacheArtifact,
+        )
+        from torch._inductor.output_code import CompiledFxGraph
+        from torch._precompile import (
+            _build_multigraph_artifact,
+            _called_op_names,
+            _custom_op_modules,
+            _custom_ops,
+            _device_kernel_keys,
+            _KERNEL_KEYS,
+            _multigraph_frames,
+            _served_modules,
+        )
 
         summary = self._gated_summary(
             require_complete=require_complete,
             require_no_risky_drops=require_no_risky_drops,
         )
         backends = self._collect_backends()
+        op_names = set(self._package.graph_break_op_names)
+        # Graph-break ops run eagerly on the devices of any compiled frame.
+        device_types = set(self._package._device_types if op_names else ())
+        for backend_id, artifact in backends.items():
+            # Unlike a make_fx capture, the graph's ops stay even if Inductor
+            # decomposed them, since the frame's guards can name them.
+            op_names |= self._package.op_names.get(backend_id, set())
+            device_types |= self._package.device_types.get(backend_id, set())
+            if isinstance(artifact, BundledAOTAutogradCacheArtifact):
+                # Inductor's code also calls the ops a post-grad pass inserted,
+                # and those of the backward.
+                compiled = (artifact.content.compiled_fw, artifact.content.compiled_bw)
+                for result in (c.result for c in compiled if c is not None):
+                    if isinstance(result, CompiledFxGraph):
+                        op_names |= _called_op_names(result.source_code)
+        entry = self._served_entry()[0]
+        ops = _custom_ops(op_names)
+        # No compiled graph names a device for graph-break ops to run on.
+        keys = _device_kernel_keys(device_types) if device_types else _KERNEL_KEYS
+        modules, unmapped = _custom_op_modules(ops, keys)
+        if unmapped:
+            # An op with no known module (torch.library.define, a C++ extension's
+            # load_library) is likely registered by a module the frames run in,
+            # which the driver imports only after the ops are checked.
+            served = _served_modules(_multigraph_frames(entry))
+            modules += tuple(sorted(served - {"__main__", *modules}))
         return _build_multigraph_artifact(
-            self._served_entry()[0], backends, summary, self._backend, self._fn
+            entry, backends, summary, self._backend, self._fn, modules, ops, keys
         )
 
 

@@ -208,17 +208,19 @@ it.
 # (torch.compiler.load_cache_artifacts), then execs python_code -- so its kernels load
 # from the precompiled binaries instead of JIT. With the cache you skip JIT; with only
 # python_code you JIT -- same results either way. One caveat: an artifact whose graph
-# calls custom ops first imports the modules recorded in CUSTOM_OP_MODULES (a failed
-# import only warns, unless the module is in CUSTOM_OP_KERNEL_MODULES: its kernel the
-# graph ran at capture replaced another for the same key), then refuses to load unless
-# every op in CUSTOM_OPS and every kernel key CUSTOM_OP_KERNELS lists for it is
-# registered. The caller must
-# import, before load, what the artifact cannot record: C++ extension ops, ops from
-# torch.library.define or __main__, and kernels registered through
-# @torch.library.impl, register_kernel or another module's Library. The
-# eager backend has no kernels to accelerate, so the eager cache carries no compiled
-# artifact (artifact=None) but is still a full integrity-tagged envelope, and load()
-# always runs the graph inlined in python_code. The metadata
+# calls custom ops first imports the modules recorded in CUSTOM_OP_MODULES (a Dynamo
+# artifact does so after its version checks; a failed import only warns, unless the
+# module is in CUSTOM_OP_KERNEL_MODULES: its kernel the graph ran at capture
+# replaced another for the same key), then refuses to load unless every op in CUSTOM_OPS and every kernel key
+# CUSTOM_OP_KERNELS lists for it is registered. A Dynamo artifact also imports its
+# served frames' modules for ops with no recorded module, so the caller must import,
+# before load, only what the artifact cannot record: for a make_fx artifact (or a
+# Dynamo one whose op is registered outside every served frame's module), C++
+# extension ops, ops from torch.library.define or __main__, and kernels registered
+# through @torch.library.impl, register_kernel or another module's Library. The eager
+# backend has no kernels to accelerate, so the eager cache carries no compiled artifact
+# (artifact=None) but is still a full integrity-tagged envelope, and load() always
+# runs the graph inlined in python_code. The metadata
 # lives in one place (python_code); the envelope carries a code_hash (sha256 of
 # python_code) alongside the format/version + backend tag, so load() rejects a
 # (python_code, cache) pair that did not come from the same precompile capture.
@@ -1930,6 +1932,20 @@ def _parse_artifact_metadata(python_code: str) -> dict[str, object]:
     return found
 
 
+def _overload_names(op: object) -> set[tuple[str, str]]:
+    """The ``(ns::op, overload)`` names of ``op`` if it is an operator: its own,
+    or every overload's for an ``OpOverloadPacket``."""
+    if isinstance(op, torch._ops.OpOverloadPacket):
+        ops = [getattr(op, name) for name in op.overloads()]
+    else:
+        ops = [op]
+    return {
+        (o._schema.name, o._schema.overload_name)
+        for o in ops
+        if isinstance(o, torch._ops.OpOverload)
+    }
+
+
 def _op_names(gm: torch.fx.GraphModule) -> set[tuple[str, str]]:
     """The ``(ns::op, overload)`` names of the operators ``gm`` and its subgraphs
     call, directly or passed to a higher-order op."""
@@ -1942,14 +1958,7 @@ def _op_names(gm: torch.fx.GraphModule) -> set[tuple[str, str]]:
             if node.op != "call_function":
                 continue
             for op in (node.target, *pytree.tree_leaves((node.args, node.kwargs))):
-                if isinstance(op, torch._ops.OpOverloadPacket):
-                    ops = [getattr(op, name) for name in op.overloads()]
-                else:
-                    ops = [op]
-                for overload in ops:
-                    if isinstance(overload, torch._ops.OpOverload):
-                        schema = overload._schema
-                        names.add((schema.name, schema.overload_name))
+                names |= _overload_names(op)
     return names
 
 
@@ -1987,6 +1996,77 @@ def _custom_op_module(op_name: str, overload: str) -> str | None:
     return name if getattr(module, "__spec__", None) is not None else None
 
 
+def _registration_path(op_name: str, overload: str) -> str:
+    """The file that defined ``op_name``, as recorded at build time ("" if none)."""
+    debug = torch._C._dispatch_find_schema_or_throw(op_name, overload).debug()
+    return debug.removeprefix("registered at ").rpartition(":")[0]
+
+
+@functools.cache
+def _torch_source_root() -> str | None:
+    """The source root torch's C++ op registrations recorded at build time (the CI
+    checkout in a wheel), from a generated and a hand-written aten schema."""
+    paths = [
+        _registration_path("aten::add", "Tensor"),
+        _registration_path("aten::quantized_lstm", "input"),
+    ]
+    try:
+        root = os.path.commonpath(paths) if all(paths) else None
+    except ValueError:
+        return None
+    # Paths sharing only a filesystem root (an out-of-tree build) match any path.
+    return root if root and root != os.path.dirname(root) else None
+
+
+def _torch_cpp_op(op_name: str, overload: str) -> bool:
+    """Whether ``import torch`` registers ``op_name`` from C++: its namespace is one
+    of torch's, and it is not an extension's that adds ops to that namespace from a
+    C++ source outside torch's root. Paths alone cannot decide: an extension built in
+    a checkout, or under a directory the root shares, lies inside the root. One that
+    is built in torch's checkout and adds ops to a torch namespace is taken for
+    torch's."""
+    if op_name.split("::")[0] not in _TORCH_OP_NAMESPACES:
+        return False
+    root = _torch_source_root()
+    path = _registration_path(op_name, overload)
+    if root is None or not path or path.endswith(".py"):
+        return True
+    return path.startswith(os.path.join(root, ""))
+
+
+# Torch's namespaces defined from C++.
+_TORCH_OP_NAMESPACES = frozenset(
+    {
+        "aten",
+        "prim",
+        "inductor",
+        "inductor_prims",
+        "profiler",
+        "quantized",
+        "_quantized",
+        "quantization",
+        "sparse",
+        "c10d",
+        "_c10d_functional",
+        "_c10d_functional_autograd",
+        "_dtensor",
+        "symm_mem",
+        "fsdp",
+        "mkl",
+        "mkldnn",
+        "mkldnn_prepacked",
+        "onednn",
+        "static_runtime",
+        "xnnpack",
+        "prepacked",
+        "vulkan",
+        "vulkan_prepack",
+        "metal",
+        "metal_prepack",
+        "vulkan_quantized",
+        "_nnapi",
+    }
+)
 _TORCH_DIR = os.path.dirname(torch.__file__)
 # torch's helpers that build a Library for the caller's namespace record themselves.
 _TORCH_OP_HELPERS = tuple(
@@ -2011,8 +2091,7 @@ def _library_op_module(
 ) -> str | None:
     """The module whose import registers ``op_name``, if a ``torch.library.Library``
     created in a loaded module defines it. ``file_modules`` is ``_file_modules``."""
-    debug = torch._C._dispatch_find_schema_or_throw(op_name, overload).debug()
-    path = debug.removeprefix("registered at ").rpartition(":")[0]
+    path = _registration_path(op_name, overload)
     if not path.endswith(".py") or path.startswith(_TORCH_OP_HELPERS):
         return None
     return file_modules().get(os.path.realpath(path))
@@ -2045,19 +2124,24 @@ def _kernel_modules(
 
 def _custom_op_modules(
     op_names: Iterable[tuple[str, str]], keys: tuple[str, ...]
-) -> tuple[str, ...]:
+) -> tuple[tuple[str, ...], tuple[tuple[str, str], ...]]:
     """The modules registering the ops among ``op_names`` and their active kernels
     for ``keys``, in the order their imports finished, so that importing them again
-    registers any overriding kernel last."""
+    registers any overriding kernel last; and the custom ops among them that no
+    known module registers."""
     file_modules = functools.cache(_file_modules)
-    modules: set[str | None] = set()
+    modules: set[str] = set()
+    unmapped: set[tuple[str, str]] = set()
     for op_name, overload in op_names:
-        modules.add(
-            _custom_op_module(op_name, overload)
-            or _library_op_module(op_name, overload, file_modules)
-        )
+        module = _custom_op_module(op_name, overload)
+        if module is None:
+            module = _library_op_module(op_name, overload, file_modules)
         modules |= _kernel_modules(op_name, overload, keys, file_modules)
-    return tuple(m for m in sys.modules if m in modules)
+        if module is not None:
+            modules.add(module)
+        elif not _torch_cpp_op(op_name, overload):
+            unmapped.add((op_name, overload))
+    return tuple(m for m in sys.modules if m in modules), tuple(sorted(unmapped))
 
 
 def _custom_ops(op_names: Iterable[tuple[str, str]]) -> tuple[tuple[str, str], ...]:
@@ -2096,11 +2180,18 @@ def _graph_kernel_keys(gm: torch.fx.GraphModule | None) -> tuple[str, ...]:
     return (*sorted(backends - {"Undefined"}), *_COMPOSITE_KERNEL_KEYS)
 
 
+def _device_kernel_keys(device_types: Iterable[str]) -> tuple[str, ...]:
+    """The composite keys and the backend keys of ``device_types``."""
+    backends = {torch._C._dispatch_key_for_device(t) for t in device_types}
+    return (*sorted(backends), *_COMPOSITE_KERNEL_KEYS)
+
+
 def _write_custom_op_imports(
     buf: PySourceBuilder,
     modules: tuple[str, ...],
     ops: tuple[tuple[str, str], ...],
     keys: tuple[str, ...],
+    call: bool = True,
 ) -> None:
     # A compiled graph calls torch.ops.<ns>.<op> directly, so nothing on the serving
     # path imports the module that registers the op. The recorded modules are the
@@ -2138,8 +2229,9 @@ def _write_custom_op_imports(
     from torch import _precompile_driver as driver
 
     buf.writeline(inspect.getsource(driver._import_custom_op_modules).rstrip())
-    buf.writeline("_import_custom_op_modules()")
-    buf.writeline("del _import_custom_op_modules")
+    if call:
+        buf.writeline("_import_custom_op_modules()")
+        buf.writeline("del _import_custom_op_modules")
     buf.writeline("")
 
 
@@ -2155,7 +2247,7 @@ def _build_python_source(
     op_names = _called_op_names(graph_python)
     if ops := _custom_ops(op_names):
         keys = _graph_kernel_keys(compiled._gm)
-        _write_custom_op_imports(buf, _custom_op_modules(ops, keys), ops, keys)
+        _write_custom_op_imports(buf, _custom_op_modules(ops, keys)[0], ops, keys)
     buf.writeline("# " + "=" * 70)
     buf.writeline("# 1. Compiled graph (AOTAutograd + Inductor): exposes ``call``")
     buf.writeline("# " + "=" * 70)
@@ -2212,7 +2304,7 @@ def _build_eager_python_source(compiled: PrecompiledModule) -> str:
     op_names = _op_names(gm)
     if ops := _custom_ops(op_names):
         keys = _graph_kernel_keys(gm)
-        _write_custom_op_imports(buf, _custom_op_modules(ops, keys), ops, keys)
+        _write_custom_op_imports(buf, _custom_op_modules(ops, keys)[0], ops, keys)
     buf.writeline("# " + "=" * 70)
     buf.writeline("# 1. Captured ATen graph (eager backend) -- executable and readable")
     buf.writeline("# " + "=" * 70)
@@ -2375,6 +2467,36 @@ def _multigraph_frames(entry: Any) -> list[dict[str, Any]]:
     ]
 
 
+def _opens_scope(frame: dict[str, Any]) -> bool:
+    """Whether ``_build_multigraph_forward`` opens ``frame``'s module for its globals."""
+    return bool(frame["variants"] or (frame["trivial"] and frame["resume_names"]))
+
+
+def _served_modules(frames: list[dict[str, Any]]) -> set[str]:
+    """The modules of the entry frame and of the frames ``_build_multigraph_forward``
+    opens a scope for, which that driver imports. Never a dead record's. The
+    installed driver's ``CompilePackage.install`` also binds the modules of the
+    codes this leaves out, which its pre-check does not cover."""
+    return {f["python_module"] for f in frames if f["is_entry"] or _opens_scope(f)}
+
+
+def _unimportable_module(modules: Iterable[str]) -> str | None:
+    """The first of ``modules`` another process cannot import, without importing it
+    (``find_spec`` does import a dotted name's parents): ``__main__``, one with no
+    spec, or one whose parent's import raises."""
+    import importlib.util
+
+    for name in modules:
+        try:
+            if name == "__main__" or (
+                name not in sys.modules and importlib.util.find_spec(name) is None
+            ):
+                return name
+        except Exception:
+            return name
+    return None
+
+
 def _reachable_frames(frames: list[dict[str, Any]]) -> set[int]:
     """Indices of the frames a standalone driver can actually dispatch.
 
@@ -2521,6 +2643,9 @@ def _build_multigraph_python_source(
     entry_binding: dict[str, Any] | None,
     mode: str,
     unreachable: list[str],
+    custom_op_modules: tuple[str, ...],
+    custom_ops: tuple[tuple[str, str], ...],
+    custom_op_keys: tuple[str, ...],
 ) -> str:
     """Render a multi-graph capture as ``python_code``.
 
@@ -2538,6 +2663,10 @@ def _build_multigraph_python_source(
     buf.writeline(_MULTIGRAPH_GENERATED_HEADER)
     buf.writeline(_SERVING_NOTES[mode])
     buf.writeline("")
+    # The driver imports them after its version checks.
+    _write_custom_op_imports(
+        buf, custom_op_modules, custom_ops, custom_op_keys, call=False
+    )
     buf.writeline("# " + "=" * 70)
     buf.writeline("# 1. What was captured (readable)")
     buf.writeline("# " + "=" * 70)
@@ -2550,6 +2679,8 @@ def _build_multigraph_python_source(
     buf.writeline(f"FN_NAME = {entry.fn_name!r}")
     buf.writeline(f"_DYNAMO_PYTHON_VERSION = {tuple(sys.version_info[:2])!r}")
     buf.writeline(f"TORCH_VERSION = {torch.__version__!r}")
+    buf.writeline("# The modules of the frames it serves, which the driver imports.")
+    buf.writeline(f"SERVED_MODULES = {tuple(sorted(_served_modules(frames)))!r}")
     buf.writeline("")
     buf.writeline(
         "# frame name -> number of captured variants. A frame with one variant"
@@ -2669,6 +2800,9 @@ def _build_multigraph_artifact(
     summary: PrecompileSummary,
     backend: str,
     entry_fn: object,
+    custom_op_modules: tuple[str, ...],
+    custom_ops: tuple[tuple[str, str], ...],
+    custom_op_keys: tuple[str, ...],
 ) -> tuple[str, bytes]:
     """``(python_code, cache)`` for a multi-graph capture.
 
@@ -2688,7 +2822,17 @@ def _build_multigraph_artifact(
     mode = "installed" if unreachable else "standalone"
     binding = _entry_binding(entry_fn) if mode == "standalone" else None
     python_code = _build_multigraph_python_source(
-        entry, frames, backends, summary, backend, binding, mode, unreachable
+        entry,
+        frames,
+        backends,
+        summary,
+        backend,
+        binding,
+        mode,
+        unreachable,
+        custom_op_modules,
+        custom_ops,
+        custom_op_keys,
     )
     inductor_bundle = None
     if backend != "eager":
