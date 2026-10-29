@@ -2179,6 +2179,7 @@ class PrecompileSession(Generic[_P, _R]):
             _KERNEL_KEYS,
             _multigraph_frames,
             _served_modules,
+            _warn_unregistered_ops,
         )
 
         summary = self._gated_summary(
@@ -2205,13 +2206,16 @@ class PrecompileSession(Generic[_P, _R]):
         ops = _custom_ops(op_names)
         # No compiled graph names a device for graph-break ops to run on.
         keys = _device_kernel_keys(device_types) if device_types else _KERNEL_KEYS
-        modules, unmapped = _custom_op_modules(ops, keys)
-        if unmapped:
+        found = _custom_op_modules(ops, keys)
+        served: set[str] = set()
+        if found.unrecorded:
             # An op with no known module (torch.library.define, a C++ extension's
             # load_library) is likely registered by a module the frames run in,
             # which the driver imports only after the ops are checked.
-            served = _served_modules(_multigraph_frames(entry))
-            modules += tuple(sorted(served - {"__main__", *modules}))
+            served = _served_modules(_multigraph_frames(entry)) - {"__main__"}
+        fallback = tuple(sorted(served - set(found.modules)))
+        modules = found.modules + fallback
+        _warn_unregistered_ops(found, fallback)
         return _build_multigraph_artifact(
             entry, backends, summary, self._backend, self._fn, modules, ops, keys
         )

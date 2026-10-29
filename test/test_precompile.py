@@ -13,6 +13,7 @@ import operator
 import os
 import pathlib
 import pickle
+import re
 import runpy
 import shutil
 import stat
@@ -51,6 +52,7 @@ from torch.testing._internal.common_device_type import instantiate_device_type_t
 from torch.testing._internal.common_utils import (
     expectedIfCppFakeTensor,
     instantiate_parametrized_tests,
+    IS_MACOS,
     IS_WINDOWS,
     parametrize,
     run_tests,
@@ -4729,6 +4731,13 @@ def single(model, x):
     return model(x).sum(dim=0)
 
 
+def reads_version(model, x):
+    # Dynamo records the _version read as prims::_tensor_version.
+    y = model(x) + 0
+    y.add_(1)
+    return y * y._version
+
+
 def reads_unregistered(model, x):
     return model(x).sum(dim=0) * unregistered.SCALE
 
@@ -5264,6 +5273,23 @@ class TestPrecompileDynamoCapture(TestCase):
         )
         # Nothing of dispatch needs installing: it runs as plain Python.
         self._serve_in_fresh_process([((self.x2, 1), {}, eager)])
+
+    @skipIfCrossRef
+    @parametrize("backend", ["inductor", "eager"])
+    def test_a_graph_calling_a_prim_imports_and_checks_it_in_a_fresh_process(
+        self, backend
+    ):
+        fn = self.mod.reads_version
+        with self._capture(fn, backend=backend) as cap:
+            y = cap(self.model, self.x2)
+        self.assertEqual(y, fn(self.model, self.x2))
+        with open(self.artifact) as f:
+            python_code = f.read()
+        self.assertIn("CUSTOM_OPS = (('prims::_tensor_version', ''),)", python_code)
+        self.assertIn(
+            "CUSTOM_OP_MODULES = ('torch._dynamo.tensor_version_op',)", python_code
+        )
+        self._serve_in_fresh_process([((self.x2,), {}, y)])
 
     @skipIfCrossRef
     @torch._dynamo.config.patch(nested_graph_breaks=False)
@@ -9820,6 +9846,9 @@ def _eager_fallback_op_fn(x):
     return x + 1
 
 
+def legacy_op(x: torch.Tensor) -> torch.Tensor: ...
+
+
 @skipIfTorchDynamo("precompile captures cannot run under dynamo wrapping")
 @instantiate_parametrized_tests
 class TestPrecompileCustomOpRecording(TestCase):
@@ -9830,6 +9859,7 @@ class TestPrecompileCustomOpRecording(TestCase):
         def op(x: torch.Tensor) -> torch.Tensor:
             return x.clone()
 
+        self.addCleanup(op._lib._destroy)
         return op, f"{ns}::{name}"
 
     def test_op_names_include_ops_passed_to_higher_order_ops(self):
@@ -9879,9 +9909,8 @@ class TestPrecompileCustomOpRecording(TestCase):
         lib.impl("op", lambda x: x.clone(), "CompositeExplicitAutograd")
         names = {(f"{ns}::op", ""), ("aten::add", "Tensor")}
         # A Library a torch helper created records no module, but is still checked.
-        self.assertEqual(
-            _custom_op_modules(names, ("CPU",)), ((), ((f"{ns}::op", ""),))
-        )
+        found = _custom_op_modules(names, ("CPU",))
+        self.assertEqual((found.modules, found.unrecorded), ((), ((f"{ns}::op", ""),)))
         self.assertEqual(_custom_ops(names), ((f"{ns}::op", ""),))
 
         # A module that imports but raises is collected like a missing one.
@@ -9924,10 +9953,12 @@ class TestPrecompileCustomOpRecording(TestCase):
         self.assertIsInstance(raised.exception.__cause__, RuntimeError)
 
     def test_extension_cpp_op_in_torch_namespace_is_custom_op(self):
-        from torch._precompile import _custom_op_modules
+        from torch._precompile import _custom_op_modules, _CustomOpModules
 
         op = ("inductor::accumulate_grad_", "")
-        self.assertEqual(_custom_op_modules([op], ("CPU",)), ((), ()))
+        self.assertEqual(
+            _custom_op_modules([op], ("CPU",)), _CustomOpModules((), (), {})
+        )
         # As an extension built elsewhere would record its TORCH_LIBRARY_FRAGMENT.
         with (
             mock.patch("torch._precompile._torch_source_root", return_value="/src/pt"),
@@ -9936,7 +9967,8 @@ class TestPrecompileCustomOpRecording(TestCase):
                 return_value="/src/extension/ext.cpp",
             ),
         ):
-            self.assertEqual(_custom_op_modules([op], ("CPU",)), ((), (op,)))
+            found = _custom_op_modules([op], ("CPU",))
+            self.assertEqual(found, _CustomOpModules((), (op,), {}))
 
     def test_extension_cpp_op_under_the_source_root_is_custom_op(self):
         from torch._precompile import _torch_cpp_op
@@ -10060,6 +10092,264 @@ class TestPrecompileCustomOpRecording(TestCase):
             dispatch_pystub.return_value = None
             self.assertIsNone(_custom_op_module(name, ""))
 
+    @parametrize("backend", ("eager", "inductor"))
+    def test_a_single_graph_capture_warns_once_about_an_unrecorded_op(self, backend):
+        op, qualname = self._op("in_main")
+        op._init_fn.__module__ = "__main__"
+        op.register_fake(torch.empty_like)
+        inputs, tracer = [(torch.ones(4),)], MakeFxTracer()
+        with self.assertLogs("torch._precompile", level="WARNING") as logs:
+            _capture_files(self, lambda x: op(x) + 1, inputs, backend, tracer=tracer)
+        (warning,) = [m for m in logs.output if qualname in m]
+        self.assertIn("no importable module is known to register", warning)
+
+    def test_custom_op_modules_reports_the_ops_no_module_registers(self):
+        from torch._native import registry as native_registry
+        from torch._precompile import _custom_op_modules, _warn_unregistered_ops
+
+        op, qualname = self._op("in_main")
+        op._init_fn.__module__ = "__main__"
+        recorded, _ = self._op("recorded")
+        module = types.ModuleType(f"precompile_registering_{uuid.uuid4().hex}")
+        module.__spec__ = importlib.machinery.ModuleSpec(module.__name__, None)
+        self.enterContext(mock.patch.dict(sys.modules, {module.__name__: module}))
+        recorded._init_fn.__module__ = module.__name__
+        ns = f"precompile_library_{uuid.uuid4().hex}"
+        lib = self.enterContext(torch.library._scoped_library(ns, "DEF"))
+        lib.define("f(Tensor x) -> Tensor")
+        torch._custom_ops.custom_op(f"{ns}::legacy_op")(legacy_op)
+        registry = torch._custom_op.impl.global_registry
+        self.addCleanup(registry[f"{ns}::legacy_op"]._destroy)
+        names = [(qualname, ""), (f"{ns}::f", ""), (f"{ns}::legacy_op", "")]
+        names.append((recorded._qualname, ""))
+        importlib.import_module("torch.export.custom_ops")
+        # A register_op_override op, which only that call defines.
+        native = f"precompile_{uuid.uuid4().hex}"
+        # Scope the op's definition and its register_fake library to this test.
+        nlib = self.enterContext(torch.library._scoped_library("_native", "FRAGMENT"))
+        self.enterContext(mock.patch.dict(native_registry._def_libs, {"_native": nlib}))
+        self.addCleanup(native_registry._defined_native_ops.discard, native)
+        fakes = self.enterContext(mock.patch.object(torch.library, "_keep_alive", []))
+        self.addCleanup(lambda: [fake._destroy() for fake in fakes])
+        native_registry._define_native_op_once(native, "aten", "neg")
+        names.append((f"_native::{native}", ""))
+
+        # Torch's own ops, registered from C++ and from Python inside torch.
+        names += [("aten::add", "Tensor"), ("export::access_subclass_inner_tensor", "")]
+        with self.assertLogs("torch._precompile", level="WARNING") as logs:
+            found = _custom_op_modules(names, ("CPU",))
+            _warn_unregistered_ops(found)
+        self.assertEqual(
+            set(found.modules), {module.__name__, "torch.export.custom_ops"}
+        )
+        self.assertEqual(
+            {op_name for op_name, _ in found.unrecorded},
+            {qualname, f"{ns}::f", f"{ns}::legacy_op"},
+        )
+        torch_ops, message = logs.output
+        self.assertIn(f"_native::{native}", torch_ops)
+        self.assertIn("register_op_override", torch_ops)
+        self.assertNotIn(f"_native::{native}", message)
+        self.assertIn(qualname, message)
+        self.assertIn(f"{ns}::f", message)
+        self.assertIn(f"{ns}::legacy_op", message)
+        self.assertNotIn(recorded._qualname, message)
+        self.assertNotIn("aten::add", message)
+        self.assertNotIn("export::", message)
+
+    @unittest.skipIf(not torch.distributed.is_available(), "requires distributed")
+    def test_an_op_a_torch_submodule_registers_records_that_module(self):
+        from torch._precompile import _custom_op_modules, _CustomOpModules
+
+        module = "torch.distributed._ops.device_mesh"
+        importlib.import_module(module)
+        ops = [
+            ("device_mesh::_runtime_compute_coordinate_on_dim", ""),
+            ("device_mesh::_get_submesh", ""),
+        ]
+        self.assertEqual(
+            _custom_op_modules(ops, ("CPU",)), _CustomOpModules((module,), (), {})
+        )
+
+    def test_an_op_torch_defines_at_cuda_init_is_reported_with_its_setup(self):
+        from torch._precompile import _custom_op_modules, _warn_unregistered_ops
+
+        name = f"precompile_{uuid.uuid4().hex}"
+        lib = self.enterContext(torch.library._scoped_library("triton", "FRAGMENT"))
+        self.enterContext(mock.patch.object(torch._TritonLibrary, "lib", lib))
+        self.enterContext(mock.patch.dict(torch._TritonLibrary.ops_table))
+        torch._TritonLibrary.registerOp(
+            name, f"{name}(Tensor x) -> Tensor", lambda x: x.clone(), "CPU"
+        )
+        found = _custom_op_modules([(f"triton::{name}", "")], ("CPU",))
+        self.assertEqual((found.modules, found.unrecorded), ((), ()))
+        with self.assertLogs("torch._precompile", level="WARNING") as logs:
+            _warn_unregistered_ops(found)
+        (message,) = logs.output
+        self.assertIn(f"triton::{name}", message)
+        self.assertIn("torch.cuda.init()", message)
+        self.assertNotIn("set_python_module", message)
+
+    def test_the_lazy_op_setups_name_existing_functions(self):
+        from torch._precompile import _TORCH_LAZY_OP_NAMESPACES, _TORCH_LAZY_OPS
+
+        setups = [*_TORCH_LAZY_OP_NAMESPACES.values(), *_TORCH_LAZY_OPS.values()]
+        names = {n for s in setups for n in re.findall(r"(torch(?:\.\w+)+)\(\)", s)}
+        self.assertIn(
+            "torch._inductor.runtime.debug_utils.register_check_mem_op", names
+        )
+        for name in names:
+            module, attr = name.rsplit(".", 1)
+            self.assertTrue(
+                callable(getattr(importlib.import_module(module), attr)), name
+            )
+
+    def test_an_op_a_torch_function_defines_is_reported_with_its_setup(self):
+        from torch._precompile import (
+            _custom_op_module,
+            _custom_op_modules,
+            _warn_unregistered_ops,
+        )
+
+        name = f"semi_structured::precompile_{uuid.uuid4().hex}"
+
+        @torch.library.custom_op(name, mutates_args=())
+        def op(x: torch.Tensor) -> torch.Tensor:
+            return x.clone()
+
+        self.addCleanup(op._lib._destroy)
+        # As cusparselt_mm, defined inside a function of a module `import torch` loads.
+        op._init_fn.__module__ = "torch.sparse.semi_structured"
+        self.assertEqual(_custom_op_module(name, ""), "torch.sparse.semi_structured")
+        found = _custom_op_modules([(name, "")], ("CPU",))
+        self.assertEqual((found.modules, found.unrecorded), ((), ()))
+        with self.assertLogs("torch._precompile", level="WARNING") as logs:
+            _warn_unregistered_ops(found)
+        (message,) = logs.output
+        self.assertIn(name, message)
+        self.assertIn("_ensure_cusparselt_mm_registered()", message)
+        self.assertNotIn("set_python_module", message)
+
+        ops = [
+            ("semi_structured::cusparselt_mm", ""),
+            ("semi_structured::cutlass_mm", ""),
+        ]
+        found = _custom_op_modules(ops, ("CPU",))
+        self.assertEqual((found.modules, found.unrecorded), ((), ()))
+        with self.assertLogs("torch._precompile", level="WARNING") as logs:
+            _warn_unregistered_ops(found)
+        cusparselt, cutlass = logs.output
+        self.assertIn("semi_structured::cusparselt_mm,", cusparselt)
+        self.assertIn(
+            "inside torch.sparse.semi_structured._ensure_cusparselt_mm", cusparselt
+        )
+        self.assertNotIn("cutlass", cusparselt)
+        self.assertIn("semi_structured::cutlass_mm,", cutlass)
+        self.assertIn("inside torch.sparse.semi_structured._ensure_cutlass_mm", cutlass)
+        self.assertNotIn("cusparselt", cutlass)
+
+    def test_a_prim_a_lazy_module_defines_is_imported_and_checked(self):
+        from torch._functorch._aot_autograd.codegen import PySourceBuilder
+        from torch._precompile import (
+            _custom_op_modules,
+            _custom_ops,
+            _write_custom_op_imports,
+        )
+
+        importlib.import_module("torch._dynamo.tensor_version_op")
+        names = {("prims::_unsafe_set_version_counter", ""), ("aten::add", "Tensor")}
+        modules, ops = _custom_op_modules(names, ("CPU",)).modules, _custom_ops(names)
+        self.assertEqual(modules, ("torch._dynamo.tensor_version_op",))
+        self.assertEqual(ops, (("prims::_unsafe_set_version_counter", ""),))
+        buf = PySourceBuilder()
+        _write_custom_op_imports(buf, modules, ops, ("CPU",))
+        self.assertIn("torch._dynamo.tensor_version_op", buf.getvalue())
+        self.assertIn("prims::_unsafe_set_version_counter", buf.getvalue())
+
+    def test_a_prim_records_the_module_defining_it(self):
+        from torch._precompile import _custom_op_modules, _CustomOpModules
+
+        importlib.import_module("torch._inductor.inductor_prims")
+        importlib.import_module("torch._dynamo.tensor_version_op")
+        expected = {
+            "add": "torch._prims",
+            "inductor_random": "torch._inductor.inductor_prims",
+            "_tensor_version": "torch._dynamo.tensor_version_op",
+            "_unsafe_set_version_counter": "torch._dynamo.tensor_version_op",
+        }
+        for name, module in expected.items():
+            found = _custom_op_modules([(f"prims::{name}", "")], ("CPU",))
+            self.assertEqual(found, _CustomOpModules((module,), (), {}))
+
+    @unittest.skipIf(IS_WINDOWS or IS_MACOS, "forks")
+    def test_no_op_torch_registers_is_reported(self):
+        script = textwrap.dedent(
+            """
+            import functools
+            import json
+            import torch
+            import torch.onnx.ops
+            import torch._dynamo.tensor_version_op
+            import torch._inductor.inductor_prims
+            from torch._precompile import _file_modules, _op_registration
+            if torch.distributed.is_available():
+                import torch.distributed.fsdp
+                import torch.distributed.pipelining
+                import torch.distributed.tensor
+                import torch.distributed._ops.device_mesh
+            reported = set()
+            modules = {}
+            file_modules = functools.cache(_file_modules)
+            for name in torch._C._dispatch_get_all_op_names():
+                op_name, _, overload = name.partition(".")
+                kind, module = _op_registration(op_name, overload, file_modules)
+                if kind == "unrecorded":
+                    reported.add(op_name.split("::")[0])
+                elif kind == "module":
+                    modules.setdefault(module, []).append([op_name, overload])
+            print(json.dumps({"reported": sorted(reported), "modules": modules}))
+            """
+        )
+        # Only a source build records C++ schemas under torch/, so they are checked
+        # against the list itself. The script first imports the torch modules that
+        # register ops on import. Namespaces this build does not register (vulkan,
+        # metal, nnapi, ...) are not checked.
+        out = subprocess.check_output([sys.executable, "-c", script], text=True)
+        scan = json.loads(out)
+        # "_test" holds TorchScript's own test ops.
+        self.assertEqual(set(scan["reported"]) - {"_test"}, set())
+
+        # Each recorded module must register its ops when imported alone, as on a fresh
+        # host. A child forked from a process that imported only torch imports each one.
+        check = textwrap.dedent(
+            """
+            import importlib, json, os, sys
+            import torch
+            modules = json.load(sys.stdin)
+            for module, ops in sorted(modules.items()):
+                sys.stdout.flush()
+                if os.fork() != 0:
+                    assert os.waitstatus_to_exitcode(os.wait()[1]) == 0, module
+                    continue
+                try:
+                    importlib.import_module(module)
+                    for op_name, overload in ops:
+                        try:
+                            torch._C._dispatch_find_schema_or_throw(op_name, overload)
+                        except RuntimeError:
+                            print(module, op_name, overload)
+                except BaseException as e:
+                    print(module, repr(e))
+                finally:
+                    sys.stdout.flush()
+                    os._exit(0)
+            """
+        )
+        self.assertGreater(len(scan["modules"]), 1)
+        modules = json.dumps(scan["modules"])
+        cmd = [sys.executable, "-c", check]
+        self.assertEqual(subprocess.check_output(cmd, input=modules, text=True), "")
+
     def test_a_capture_records_the_ops_of_each_backend_graph(self):
         from torch._dynamo.precompile_package import _CapturePackage
 
@@ -10142,8 +10432,32 @@ class TestPrecompileCustomOpRecording(TestCase):
 
     @unittest.skipIf(not torch.distributed.is_available(), "requires distributed")
     def test_a_torch_cpp_op_does_not_import_the_frame_modules(self):
-        line, _ = self._render_with_ops([("_c10d_functional::wait_tensor", "")])
-        self.assertEqual(line, "CUSTOM_OP_MODULES = ()")
+        importlib.import_module("torch.distributed._ops.device_mesh")
+        ops = [("_c10d_functional::wait_tensor", ""), ("device_mesh::_get_submesh", "")]
+        line, _ = self._render_with_ops(ops)
+        modules = ("torch.distributed._ops.device_mesh",)
+        self.assertEqual(line, f"CUSTOM_OP_MODULES = {modules!r}")
+
+    def test_an_unrecorded_op_warns_once_and_imports_the_frame_modules(self):
+        op, qualname = self._op("in_main")
+        op._init_fn.__module__ = "__main__"
+        with self.assertLogs("torch._precompile", level="WARNING") as logs:
+            line, name = self._render_with_ops([(qualname, "")])
+        self.assertEqual(line, f"CUSTOM_OP_MODULES = {(name,)!r}")
+        (warning,) = [m for m in logs.output if qualname in m]
+        self.assertIn(f"imports {name}, the modules its frames run in", warning)
+
+    def test_a_library_defined_op_warns_that_the_frame_modules_are_a_fallback(self):
+        from torch.library import _scoped_library
+
+        lib = self.enterContext(_scoped_library("precompile_defined", "DEF"))
+        lib.define("op(Tensor x) -> Tensor")
+        with self.assertLogs("torch._precompile", level="WARNING") as logs:
+            line, name = self._render_with_ops([("precompile_defined::op", "")])
+        self.assertEqual(line, f"CUSTOM_OP_MODULES = {(name,)!r}")
+        (warning,) = [m for m in logs.output if "precompile_defined::op" in m]
+        self.assertIn(f"imports {name}, the modules its frames run in", warning)
+        self.assertIn("as a best-effort fallback", warning)
 
     def test_an_op_dynamo_graph_breaks_on_is_checked(self):
         from torch.library import _scoped_library

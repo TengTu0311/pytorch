@@ -292,6 +292,7 @@ from typing import (
     cast,
     Generic,
     Literal,
+    NamedTuple,
     NewType,
     ParamSpec,
     TYPE_CHECKING,
@@ -2068,9 +2069,45 @@ _TORCH_OP_NAMESPACES = frozenset(
     }
 )
 _TORCH_DIR = os.path.dirname(torch.__file__)
-# torch's helpers that build a Library for the caller's namespace record themselves.
+# torch's helpers that build a Library for the caller's namespace record themselves,
+# so the torch modules defining ops through them are listed by namespace.
 _TORCH_OP_HELPERS = tuple(
     os.path.join(_TORCH_DIR, name) for name in ("library.py", "_library", "_custom_op")
+)
+_TORCH_HELPER_OP_MODULES = MappingProxyType(
+    {
+        "coor": "torch.fx.experimental.proxy_tensor",
+        "debugprims": "torch._prims",
+        "device_mesh": "torch.distributed._ops.device_mesh",
+        "onnx": "torch.onnx.ops._impl",
+        "pippy": "torch.distributed.pipelining._IR",
+    }
+)
+# The modules defining prims with torch._prims._make_prim, which records itself.
+_TORCH_PRIM_MODULES = (
+    "torch._prims",
+    "torch._inductor.inductor_prims",
+    "torch._dynamo.tensor_version_op",
+)
+# Torch namespaces defined only when a function runs, not by a module import, and
+# what must run on the serving host before the artifact loads.
+_TORCH_LAZY_OP_NAMESPACES = MappingProxyType(
+    {
+        "triton": "CUDA initialization (torch.cuda.init())",
+        "_inductor_debug": "torch._inductor.runtime.debug_utils.register_check_mem_op()",
+        # The op name comes from a process-global counter, so only the same call
+        # sequence reproduces it.
+        "_native": "a torch._native register_op_override call",
+        "semi_structured": "torch.sparse.semi_structured._ensure_cusparselt_mm_registered() "
+        "or _ensure_cutlass_mm_registered()",
+    }
+)
+# The setup of the lazy ops whose setup is narrower than their namespace's.
+_TORCH_LAZY_OPS = MappingProxyType(
+    {
+        "semi_structured::cusparselt_mm": "torch.sparse.semi_structured._ensure_cusparselt_mm_registered()",
+        "semi_structured::cutlass_mm": "torch.sparse.semi_structured._ensure_cutlass_mm_registered()",
+    }
 )
 
 
@@ -2089,11 +2126,16 @@ def _file_modules() -> dict[str, str]:
 def _library_op_module(
     op_name: str, overload: str, file_modules: Callable[[], dict[str, str]]
 ) -> str | None:
-    """The module whose import registers ``op_name``, if a ``torch.library.Library``
-    created in a loaded module defines it. ``file_modules`` is ``_file_modules``."""
+    """The module whose import registers ``op_name``, if a loaded module defines it:
+    the one a torch helper defines it from (listed in ``_TORCH_HELPER_OP_MODULES``),
+    or the one creating the ``torch.library.Library`` that defines it.
+    ``file_modules`` is ``_file_modules``."""
+    ns = op_name.split("::")[0]
     path = _registration_path(op_name, overload)
-    if not path.endswith(".py") or path.startswith(_TORCH_OP_HELPERS):
+    if not path.endswith(".py"):
         return None
+    if path.startswith(_TORCH_OP_HELPERS):
+        return _TORCH_HELPER_OP_MODULES.get(ns)
     return file_modules().get(os.path.realpath(path))
 
 
@@ -2122,34 +2164,112 @@ def _kernel_modules(
     return {m for m in modules if m and m.partition(".")[0] != "torch"}
 
 
+def _op_registration(
+    op_name: str, overload: str, file_modules: Callable[[], dict[str, str]]
+) -> tuple[Literal["lazy", "module", "torch", "unrecorded"], str]:
+    """What registers ``op_name`` on a fresh host: ``("lazy", setup)`` for a torch op
+    defined only once ``setup`` runs, ``("module", name)`` for one an importable
+    module registers, ``("torch", "")`` for one ``import torch`` registers from C++,
+    and ``("unrecorded", "")`` otherwise."""
+    ns = op_name.split("::")[0]
+    # Checked first: a lazy custom_op's module imports without defining it.
+    if ns in _TORCH_LAZY_OP_NAMESPACES:
+        return "lazy", _TORCH_LAZY_OPS.get(op_name, _TORCH_LAZY_OP_NAMESPACES[ns])
+    if ns == "prims":
+        # torch._prims._make_prim defines every prim from its own function.
+        op = getattr(
+            getattr(torch.ops.prims, op_name.split("::")[1]), overload or "default"
+        )
+        modules = (sys.modules.get(name) for name in _TORCH_PRIM_MODULES)
+        owners = (m for m in modules if m and any(v is op for v in vars(m).values()))
+        module = next((m.__name__ for m in owners), None)
+    else:
+        module = _custom_op_module(op_name, overload) or _library_op_module(
+            op_name, overload, file_modules
+        )
+    if module is not None:
+        return "module", module
+    return ("torch" if _torch_cpp_op(op_name, overload) else "unrecorded"), ""
+
+
+class _CustomOpModules(NamedTuple):
+    """What registers a capture's custom ops, from ``_custom_op_modules``."""
+
+    # The modules registering the ops, in the order their imports finished, so that
+    # importing them again registers any overriding kernel last.
+    modules: tuple[str, ...]
+    # The custom ops no importable module is known to register.
+    unrecorded: tuple[tuple[str, str], ...]
+    # The ops torch defines only at runtime, by the setup that defines them.
+    lazy: dict[str, tuple[str, ...]]
+
+
 def _custom_op_modules(
     op_names: Iterable[tuple[str, str]], keys: tuple[str, ...]
-) -> tuple[tuple[str, ...], tuple[tuple[str, str], ...]]:
-    """The modules registering the ops among ``op_names`` and their active kernels
-    for ``keys``, in the order their imports finished, so that importing them again
-    registers any overriding kernel last; and the custom ops among them that no
-    known module registers."""
-    file_modules = functools.cache(_file_modules)
+) -> _CustomOpModules:
+    """What registers the ops among ``op_names`` and their active kernels for
+    ``keys``; pass it to ``_warn_unregistered_ops``."""
     modules: set[str] = set()
-    unmapped: set[tuple[str, str]] = set()
+    unrecorded: set[tuple[str, str]] = set()
+    lazy: dict[str, set[str]] = {}
+    file_modules = functools.cache(_file_modules)
     for op_name, overload in op_names:
-        module = _custom_op_module(op_name, overload)
-        if module is None:
-            module = _library_op_module(op_name, overload, file_modules)
+        kind, value = _op_registration(op_name, overload, file_modules)
+        if kind == "lazy":
+            lazy.setdefault(value, set()).add(op_name)
+            continue
         modules |= _kernel_modules(op_name, overload, keys, file_modules)
-        if module is not None:
-            modules.add(module)
-        elif not _torch_cpp_op(op_name, overload):
-            unmapped.add((op_name, overload))
-    return tuple(m for m in sys.modules if m in modules), tuple(sorted(unmapped))
+        if kind == "module":
+            modules.add(value)
+        elif kind == "unrecorded":
+            unrecorded.add((op_name, overload))
+    lazy_ops = {setup: tuple(sorted(ops)) for setup, ops in sorted(lazy.items())}
+    ordered = tuple(m for m in sys.modules if m in modules)
+    return _CustomOpModules(ordered, tuple(sorted(unrecorded)), lazy_ops)
+
+
+def _warn_unregistered_ops(
+    found: _CustomOpModules, fallback_modules: Sequence[str] = ()
+) -> None:
+    """Warns about the ops ``found`` says torch defines only at runtime or no
+    module registers, naming the ``fallback_modules`` the artifact imports in case
+    they register the latter."""
+    for setup, ops in sorted(found.lazy.items()):
+        log.warning(
+            "torch.compiler.precompile: the captured graphs call %s, which torch "
+            "defines only inside %s, so serving this artifact is unsupported: it "
+            "fails to load on a host where that has not run.",
+            ", ".join(ops),
+            setup,
+        )
+    if not (names := sorted({op_name for op_name, _ in found.unrecorded})):
+        return
+    serves = (
+        f"The artifact imports {', '.join(fallback_modules)}, the modules its "
+        "frames run in, as a best-effort fallback, and serves only where those or "
+        "something else register them before it is loaded."
+        if fallback_modules
+        else "The artifact serves only where something else registers them before "
+        "it is loaded."
+    )
+    log.warning(
+        "torch.compiler.precompile: the captured graphs call %s, which no "
+        "importable module is known to register: defined in __main__, defined "
+        "with torch.library.define or torch._custom_ops.custom_op, or a C++ op "
+        "without set_python_module. %s "
+        "Define a Python op with torch.library.custom_op in an importable module, "
+        "and give a C++ op m.set_python_module; for a library's ops, import that "
+        "library before loading the artifact.",
+        ", ".join(names),
+        serves,
+    )
 
 
 def _custom_ops(op_names: Iterable[tuple[str, str]]) -> tuple[tuple[str, str], ...]:
-    """The ops among ``op_names`` outside aten and prims, which the artifact checks
-    are registered once its imports ran."""
-    return tuple(
-        sorted(n for n in op_names if n[0].split("::")[0] not in ("aten", "prims"))
-    )
+    """The ops among ``op_names`` outside aten, which the artifact checks are
+    registered once its imports ran. Prims are kept: inductor's and dynamo's are
+    registered only once their modules are imported."""
+    return tuple(sorted(n for n in op_names if not n[0].startswith("aten::")))
 
 
 _COMPOSITE_KERNEL_KEYS = (
@@ -2247,7 +2367,9 @@ def _build_python_source(
     op_names = _called_op_names(graph_python)
     if ops := _custom_ops(op_names):
         keys = _graph_kernel_keys(compiled._gm)
-        _write_custom_op_imports(buf, _custom_op_modules(ops, keys)[0], ops, keys)
+        found = _custom_op_modules(ops, keys)
+        _warn_unregistered_ops(found)
+        _write_custom_op_imports(buf, found.modules, ops, keys)
     buf.writeline("# " + "=" * 70)
     buf.writeline("# 1. Compiled graph (AOTAutograd + Inductor): exposes ``call``")
     buf.writeline("# " + "=" * 70)
@@ -2304,7 +2426,9 @@ def _build_eager_python_source(compiled: PrecompiledModule) -> str:
     op_names = _op_names(gm)
     if ops := _custom_ops(op_names):
         keys = _graph_kernel_keys(gm)
-        _write_custom_op_imports(buf, _custom_op_modules(ops, keys)[0], ops, keys)
+        found = _custom_op_modules(ops, keys)
+        _warn_unregistered_ops(found)
+        _write_custom_op_imports(buf, found.modules, ops, keys)
     buf.writeline("# " + "=" * 70)
     buf.writeline("# 1. Captured ATen graph (eager backend) -- executable and readable")
     buf.writeline("# " + "=" * 70)

@@ -96,8 +96,7 @@ def _import_custom_op_modules():
     for module in CUSTOM_OP_MODULES:
         try:
             importlib.import_module(module)
-        # Not just ImportError: e.g. importing torch.distributed.device_mesh before
-        # torch.distributed.tensor raises ValueError.
+        # Not just ImportError: a module can raise anything while it registers ops.
         except Exception as e:
             import_errors[module] = e
     missing = []
