@@ -1,6 +1,7 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
 # Owner(s): ["oncall: distributed"]
 
+import copy
 from contextlib import nullcontext
 
 import torch
@@ -19,12 +20,15 @@ from torch.distributed._local_tensor import (
 from torch.distributed.tensor import (
     DeviceMesh,
     distribute_tensor,
+    DTensor,
     init_device_mesh,
     Partial,
     Replicate,
     Shard,
     zeros,
 )
+from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
+from torch.overrides import TorchFunctionMode
 from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
     parametrize,
@@ -32,6 +36,24 @@ from torch.testing._internal.common_utils import (
     TestCase,
 )
 from torch.testing._internal.distributed._tensor.common_dtensor import reduce_local_int
+from torch.utils import _pytree as pytree
+
+
+class _RejectPlainTensors(TorchFunctionMode):
+    """
+    Fails any torch function call that receives a plain (non-LocalTensor) tensor.
+
+    Stands in for user modes that only know about user-visible tensors, e.g. a
+    type checker that rejects tensors it has not annotated. LocalTensor's
+    per-rank tensors are implementation details such a mode must never see.
+    """
+
+    def __torch_function__(self, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+        for arg in pytree.tree_leaves((args, kwargs)):
+            if isinstance(arg, torch.Tensor) and not isinstance(arg, LocalTensor):
+                raise AssertionError(f"TorchFunctionMode saw a plain tensor in {func}")
+        return func(*args, **kwargs)
 
 
 class LocalTensorTestBase(TestCase):
@@ -123,6 +145,7 @@ class LocalTensorWorldTest(LocalTensorTestBase):
             pass
 
 
+@instantiate_parametrized_tests
 class TestLocalTensorWorld2(LocalTensorWorldTest):
     world_size = 2
 
@@ -245,6 +268,154 @@ class TestLocalTensorWorld2(LocalTensorWorldTest):
         node2 = LocalIntNode({0: 10, 1: 10})
         result = node1.le(node2)
         self.assertTrue(bool(result))
+
+    def test_local_int_node_has_no_hint(self):
+        node = LocalIntNode({0: 3, 1: 5})
+        self.assertFalse(node.has_hint())
+        self.assertFalse(torch.SymInt(node).has_hint())
+
+    @parametrize("full_slice", [False, True])
+    @parametrize("leading_one", [False, True])
+    def test_index_put_with_rank_varying_rows(self, full_slice, leading_one):
+        """Indexed assignment whose value has a different row count per rank,
+        optionally behind a constant size-1 leading dim (which gets stripped)."""
+        values = {
+            0: torch.arange(6.0).reshape(3, 2),
+            1: torch.arange(10.0).reshape(5, 2),
+        }
+        indices = {0: torch.tensor([2, 0, 1]), 1: torch.tensor([4, 3, 2, 1, 0])}
+        with LocalTensorMode(self.world_size):
+            out = LocalTensor({r: torch.zeros_like(v) for r, v in values.items()})
+            index = LocalTensor(indices)
+            value = LocalTensor(values)
+            if leading_one:
+                value = value.unsqueeze(0)
+            out[(index, slice(None)) if full_slice else index] = value
+        for r, v in values.items():
+            expected = torch.zeros_like(v)
+            expected[indices[r]] = v
+            self.assertEqual(out._local_tensors[r], expected)
+
+    def test_per_rank_bookkeeping_hidden_from_torch_function_modes(self):
+        """LocalTensor's simulator work (per-rank ops, comparing and copying the
+        per-rank tensors, per-rank RNG state) must not expose per-rank tensors
+        to user TorchFunctionModes. Each operation runs under a mode that
+        rejects plain tensors and its result is checked outside the mode; a
+        final positive control checks that the mode does fire on a leak."""
+        replicated = {0: torch.tensor([1.0, 2.0]), 1: torch.tensor([1.0, 2.0])}
+        rank_ints = {0: torch.tensor([1, 2]), 1: torch.tensor([3, 4])}
+        mats = {
+            0: torch.arange(6.0).reshape(2, 3),
+            1: torch.arange(6.0).reshape(2, 3) + 10,
+        }
+
+        def enter_nested_mode():
+            with LocalTensorMode(self.world_size):
+                pass
+
+        def check_deepcopy(out):
+            self.assertEqual(out, lt_mats)
+            for r, mat in mats.items():
+                self.assertIsNot(out._local_tensors[r], mat)
+
+        def check_contiguous(out):
+            self.assertTrue(out.is_contiguous())
+            self.assertEqual(out, LocalTensor({r: m.t() for r, m in mats.items()}))
+
+        def check_reconcile(out):
+            self.assertEqual(out, replicated[0])
+            self.assertFalse(out.requires_grad)
+
+        with LocalTensorMode(self.world_size):
+            mesh = self.build_device_mesh()
+            lt_replicated = LocalTensor(replicated)
+            lt_ints = LocalTensor(rank_ints)
+            lt_mats = LocalTensor(mats)
+            lt_mats_copy = LocalTensor({r: m.clone() for r, m in mats.items()})
+            cases = {
+                "construct": (
+                    lambda: LocalTensor(mats),
+                    lambda out: self.assertEqual(out, lt_mats),
+                ),
+                "tolist_replicated": (
+                    lt_replicated.tolist,
+                    lambda out: self.assertEqual(out, [1.0, 2.0]),
+                ),
+                "tolist_per_rank_ints": (
+                    lt_ints.tolist,
+                    lambda out: self.assertEqual(
+                        [x.node._local_ints for x in out],
+                        [{0: 1, 1: 3}, {0: 2, 1: 4}],
+                    ),
+                ),
+                "reconcile": (lt_replicated.reconcile, check_reconcile),
+                "numpy": (
+                    lt_replicated.numpy,
+                    lambda out: self.assertEqual(out.tolist(), [1.0, 2.0]),
+                ),
+                "is_contiguous": (lt_mats.is_contiguous, self.assertTrue),
+                "contiguous": (lambda: lt_mats.t().contiguous(), check_contiguous),
+                "repr": (
+                    lambda: repr(lt_mats),
+                    lambda out: self.assertIn("LocalTensor(", out),
+                ),
+                "deepcopy": (lambda: copy.deepcopy(lt_mats), check_deepcopy),
+                "sync_meta": (lt_mats._sync_meta, None),
+                "manual_seed": (lambda: torch.manual_seed(0), None),
+                "enter_mode": (enter_nested_mode, None),
+                # The DTensor constructor reads storage_offset from C++, which
+                # dispatches into LocalTensor without a torch function call, so
+                # the user mode is still active inside __torch_dispatch__. The
+                # Replicate broadcast writes into its input, hence the copy.
+                "distribute_tensor": (
+                    lambda: distribute_tensor(lt_mats_copy, mesh, [Replicate()]),
+                    lambda out: self.assertEqual(
+                        out.to_local(), LocalTensor(dict.fromkeys(mats, mats[0]))
+                    ),
+                ),
+            }
+            for name, (op, check) in cases.items():
+                with self.subTest(op=name):
+                    with _RejectPlainTensors():
+                        out = op()
+                    if check is not None:
+                        check(out)
+
+            with self.assertRaisesRegex(AssertionError, "saw a plain tensor"):
+                with _RejectPlainTensors():
+                    torch.add(mats[0], 1)
+
+    def test_subclass_dispatch_hidden_from_torch_function_modes(self):
+        """With no LocalTensorMode active, an op C++ issues without a torch
+        function call (here the DTensor constructor reading storage_offset)
+        goes through LocalTensor.__torch_dispatch__, which re-dispatches it
+        under a LocalTensorMode. A user mode must not see that internal
+        re-dispatch, while it still sees the user's own calls."""
+
+        class RecordCalls(TorchFunctionMode):
+            def __init__(self):
+                super().__init__()
+                self.calls = []
+
+            def __torch_function__(self, func, types, args=(), kwargs=None):
+                self.calls.append(func)
+                return func(*args, **(kwargs or {}))
+
+        mesh = self.build_device_mesh()
+        lt = LocalTensor({r: torch.arange(4.0) for r in range(self.world_size)})
+        spec = DTensorSpec(
+            mesh,
+            (Replicate(),),
+            tensor_meta=TensorMeta(lt.shape, lt.stride(), lt.dtype),
+        )
+        recorder = RecordCalls()
+        with recorder:
+            dt = DTensor(lt, spec, requires_grad=False)
+            calls_from_constructor = list(recorder.calls)
+            torch.add(lt, 1)
+        self.assertListEqual([str(f) for f in calls_from_constructor], [])
+        self.assertEqual(recorder.calls, [torch.add])
+        self.assertIs(dt._local_tensor, lt)
 
     def test_data_ptr_raises(self):
         """data_ptr() on a LocalTensor should raise instead of returning 0."""
